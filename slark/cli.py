@@ -74,6 +74,41 @@ def cmd_strip(args):
     _write_output(args, wm.strip(text))
 
 
+def _load_image(path):
+    try:
+        from slark import image as imgmod
+    except ImportError:
+        print('Image support requires Pillow: pip install "slark[image]"', file=sys.stderr)
+        sys.exit(2)
+    return imgmod, path
+
+
+def cmd_encode_image(args):
+    imgmod, path = _load_image(args.file)
+    from PIL import Image
+
+    extra = json.loads(args.extra) if args.extra else None
+    marked = imgmod.encode(
+        path, model=args.model, generator=args.generator, extra=extra
+    )
+    out = args.output or "slarked.png"
+    marked.save(out, format="PNG")
+    print(f"Wrote {out}", file=sys.stderr)
+
+
+def cmd_check_image(args):
+    imgmod, path = _load_image(args.file)
+    if imgmod.has_watermark(path):
+        meta = imgmod.decode(path)
+        print("watermarked")
+        if meta is not None:
+            print(json.dumps(meta, indent=2), file=sys.stderr)
+        sys.exit(0)
+    else:
+        print("clean")
+        sys.exit(1)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Invisible text watermarking tool")
     sub = p.add_subparsers(dest="command", required=True)
@@ -102,6 +137,22 @@ def build_parser():
     sp = sub.add_parser("strip", help="Remove watermark, output clean text")
     add_io_args(sp)
     sp.set_defaults(func=cmd_strip)
+
+    sp = sub.add_parser(
+        "encode-image", help="Embed an invisible tag in an image (PNG output)"
+    )
+    sp.add_argument("--file", required=True, help="Path to input image")
+    sp.add_argument("--output", help="Path to write PNG (default: slarked.png)")
+    sp.add_argument("--model", help="Model name/id to embed")
+    sp.add_argument("--generator", default="ai", help="Generator tag, default 'ai'")
+    sp.add_argument("--extra", help="Extra metadata as JSON string")
+    sp.set_defaults(func=cmd_encode_image)
+
+    sp = sub.add_parser(
+        "check-image", help="Check if an image carries a tag (exit code)"
+    )
+    sp.add_argument("--file", required=True, help="Path to image to check")
+    sp.set_defaults(func=cmd_check_image)
 
     return p
 

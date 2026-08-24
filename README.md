@@ -72,6 +72,42 @@ Arbitrary metadata:
 slark.encode(text, metadata={"session": "abc123", "reviewed": True})
 ```
 
+### Images (PNG, optional extra)
+
+The same hidden-tag idea for images: the payload is written into the least-
+significant bit of each pixel's R/G/B channels — every channel shifts by at
+most 1/255, invisible to any eye. The frame is embedded redundantly (up to
+512 copies), so local damage rarely destroys every copy, and the checksum is
+verified before anything is believed. Format matches the web playground
+exactly — files stamp in one and decode in the other.
+
+```bash
+pip install "slark[image]"
+```
+
+```python
+from slark import image
+
+marked = image.encode("photo.png", model="claude-sonnet-5")
+marked.save("photo-marked.png")          # PNG only — JPEG erases the tag
+
+image.decode("photo-marked.png")
+# {'g': 'ai', 'ts': 1787322082, 'm': 'claude-sonnet-5'}
+
+image.has_watermark("photo.png")         # False
+```
+
+CLI:
+
+```bash
+slark encode-image --file photo.png --model claude-sonnet-5 --output out.png
+slark check-image --file out.png     # exit code 0 = watermarked, 1 = not
+```
+
+> **Keep it PNG end-to-end.** Every lossy hop — JPEG, WebP, screenshots,
+> most social platforms' re-encoding — rewrites low-order bits and strips
+> the tag by design. This is provenance marking, not DRM.
+
 ### CLI
 
 ```bash

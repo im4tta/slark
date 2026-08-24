@@ -70,6 +70,23 @@ def _find_insert_index(text: str) -> int:
     return idx + 1 if idx != -1 else 0
 
 
+def _default_metadata(
+    metadata: Optional[dict],
+    model: Optional[str],
+    generator: str,
+    timestamp: Optional[int],
+    extra: Optional[dict],
+) -> dict:
+    if metadata is not None:
+        return metadata
+    meta = {"g": generator, "ts": timestamp or int(time.time())}
+    if model:
+        meta["m"] = model
+    if extra:
+        meta.update(extra)
+    return meta
+
+
 def encode(
     text: str,
     metadata: Optional[dict] = None,
@@ -93,14 +110,13 @@ def encode(
     Returns:
         The watermarked text (visually identical to the input).
     """
-    if metadata is None:
-        metadata = {"g": generator, "ts": timestamp or int(time.time())}
-        if model:
-            metadata["m"] = model
-        if extra:
-            metadata.update(extra)
+    metadata = _default_metadata(metadata, model, generator, timestamp, extra)
 
-    payload_json = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+    # Compact separators + raw non-ASCII match JavaScript's JSON.stringify
+    # byte-for-byte, keeping payloads interoperable with the browser playground.
+    payload_json = json.dumps(
+        metadata, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
     checksum = zlib.crc32(payload_json) & 0xFFFFFFFF
     framed = len(payload_json).to_bytes(2, "big") + checksum.to_bytes(4, "big") + payload_json
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "slark"
 version = "0.1.0"
-description = "Invisible zero-width text watermarking for marking AI-generated (or any) text"
+description = "Invisible zero-width text and PNG pixel watermarking for marking AI-generated (or any) content"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -35,7 +35,8 @@ Issues = "https://github.com/im4tta/slark/issues"
 slark = "slark.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+image = ["pillow>=9.0"]
+dev = ["pytest>=7.0", "pillow>=9.0"]
 
 [tool.setuptools.packages.find]
 include = ["slark*"]
