@@ -3,6 +3,8 @@
 Invisible text watermarking — embed a hidden, checksum-verified payload into
 any text using zero-width Unicode characters. The visible text is unchanged;
 the mark travels with the text as long as those characters survive.
+The web playground applies the same idea to images, hiding tags in the
+least-significant bits of PNG pixels.
 
 The name is a nod to *"slak"* (ស្លាក), Khmer for **tag** or **label** —
 which is exactly what this attaches, invisibly.
