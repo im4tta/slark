@@ -7,6 +7,8 @@ the mark travels with the text as long as those characters survive.
 The name is a nod to *"slak"* (ស្លាក), Khmer for **tag** or **label** —
 which is exactly what this attaches, invisibly.
 
+**Live playground:** [im4tta.github.io/slark](https://im4tta.github.io/slark/)
+
 Originally built to mark AI/LLM-generated text with provenance metadata
 (model name, timestamp), but the payload is arbitrary JSON — use it for
 leak-tracing, authorship tagging, or any lightweight text provenance need.

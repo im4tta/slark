@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>slark — invisible text tags</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink-bg: #12151b;
+    --ink-bg-raised: #1a1e26;
+    --ink-fg: #ece6d6;
+    --ink-fg-dim: #a8a293;
+    --paper-bg: #e4d9be;
+    --paper-bg-raised: #ede3c9;
+    --paper-fg: #201c13;
+    --paper-fg-dim: #6b6350;
+    --brass: #c89b3c;
+    --brass-dim: #8f6f2b;
+    --brass-bright: #e0b654;
+    --verified: #4c7a5e;
+    --verified-bg: rgba(76, 122, 94, 0.14);
+    --unverified: #b14e3b;
+    --unverified-bg: rgba(177, 78, 59, 0.14);
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --display: 'Fraunces', Georgia, serif;
+    --body: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --radius: 4px;
+    --radius-lg: 10px;
+    --header-h: 0px;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--paper-bg);
+    color: var(--paper-fg);
+    font-family: var(--body);
+    line-height: 1.5;
+  }
+
+  :focus-visible { outline: 2px solid var(--brass-bright); outline-offset: 2px; }
+  button, [role="tab"] { font: inherit; }
+  button { min-height: 44px; }
+
+  /* ---------- header ---------- */
+  header {
+    background: var(--ink-bg);
+    color: var(--ink-fg);
+    padding: clamp(2rem, 6vw, 3rem) 1.25rem clamp(1.5rem, 4vw, 2.5rem);
+    text-align: center;
+    border-bottom: 3px solid var(--brass);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--brass);
+    margin: 0 0 0.9rem;
+  }
+  h1 {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: clamp(2rem, 8vw, 3.4rem);
+    margin: 0 0 0.6rem;
+    letter-spacing: -0.01em;
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  h1 .khmer { color: var(--ink-fg-dim); font-weight: 400; font-size: 0.5em; }
+  .lede {
+    max-width: 620px;
+    margin: 0 auto;
+    color: var(--ink-fg-dim);
+    font-size: clamp(0.92rem, 2.6vw, 1.02rem);
+  }
+  .lede strong { color: var(--ink-fg); font-weight: 500; }
+
+  /* ---------- mobile tab switcher ---------- */
+  .tabbar {
+    display: none;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--ink-bg);
+    padding: 0.6rem 0.9rem;
+    border-bottom: 1px solid #2a2f3b;
+  }
+  .tabbar-inner {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    background: var(--ink-bg-raised);
+    border-radius: 999px;
+    padding: 4px;
+    gap: 4px;
+  }
+  .tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--ink-fg-dim);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.65rem 0.5rem;
+    border-radius: 999px;
+    cursor: pointer;
+    min-height: 40px;
+  }
+  .tab-btn[aria-selected="true"] { background: var(--brass); color: #1a1408; font-weight: 600; }
+
+  @media (max-width: 880px) {
+    .tabbar { display: block; }
+  }
+
+  /* ---------- layout ---------- */
+  main { max-width: 1180px; margin: 0 auto; padding: 0 0 3rem; }
+
+  .stage {
+    display: grid;
+    grid-template-columns: 1fr 22px 1fr;
+    align-items: stretch;
+    min-height: 640px;
+  }
+  @media (max-width: 880px) {
+    .stage { grid-template-columns: 1fr; }
+    .seam { display: none; }
+    .panel { display: none; }
+    .panel.active { display: flex; }
+  }
+
+  .panel {
+    padding: clamp(1.5rem, 4vw, 2.75rem) clamp(1.1rem, 4vw, 2.25rem);
+    display: flex;
+    flex-direction: column;
+    gap: 1.1rem;
+  }
+  .panel.ink { background: var(--ink-bg); color: var(--ink-fg); }
+  .panel.paper { background: var(--paper-bg); color: var(--paper-fg); }
+
+  .panel-eyebrow {
+    font-family: var(--mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .panel.ink .panel-eyebrow { color: var(--brass); }
+  .panel.paper .panel-eyebrow { color: var(--brass-dim); }
+  .panel-eyebrow .num { opacity: 0.55; }
+
+  .panel h2 { font-family: var(--display); font-weight: 600; font-size: clamp(1.3rem, 4vw, 1.5rem); margin: 0; }
+  .panel p.hint { margin: 0; font-size: 0.9rem; opacity: 0.75; max-width: 46ch; }
+
+  .seam {
+    background-image: repeating-radial-gradient(circle at 11px 0, transparent 0 6px, var(--paper-bg) 6.5px 20px);
+    background-color: var(--brass);
+  }
+
+  label {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    opacity: 0.7;
+    display: block;
+    margin-bottom: 0.35rem;
+  }
+
+  textarea, input[type="text"] {
+    width: 100%;
+    font-family: var(--body);
+    font-size: 16px; /* prevents iOS auto-zoom on focus */
+    padding: 0.75rem 0.85rem;
+    border-radius: var(--radius);
+    border: 1px solid;
+    resize: vertical;
+    min-height: 44px;
+  }
+  .panel.ink textarea, .panel.ink input[type="text"] { background: var(--ink-bg-raised); border-color: #33394a; color: var(--ink-fg); }
+  .panel.paper textarea, .panel.paper input[type="text"] { background: var(--paper-bg-raised); border-color: #cbbd97; color: var(--paper-fg); }
+  textarea.mono, input.mono { font-family: var(--mono); font-size: 15px; }
+
+  .field-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+  .field-row > div { flex: 1; min-width: 140px; }
+
+  button {
+    font-family: var(--body);
+    font-weight: 500;
+    font-size: 0.94rem;
+    padding: 0.75rem 1.2rem;
+    border-radius: var(--radius);
+    border: none;
+    cursor: pointer;
+    transition: transform 0.08s ease, filter 0.15s ease, background 0.15s ease;
+  }
+  button:active { transform: translateY(1px); }
+  .btn-primary { background: var(--brass); color: #1a1408; font-weight: 600; box-shadow: 0 2px 0 var(--brass-dim); }
+  .btn-primary:hover { filter: brightness(1.08); }
+  .btn-primary:active { box-shadow: none; transform: translateY(2px); }
+  .btn-secondary {
+    background: transparent;
+    border: 1px solid;
+    font-size: 0.85rem;
+    padding: 0.6rem 1rem;
+  }
+  .panel.ink .btn-secondary { border-color: #3a4152; color: var(--ink-fg); }
+  .panel.paper .btn-secondary { border-color: #cbbd97; color: var(--paper-fg); }
+  .btn-secondary.on { background: var(--brass); border-color: var(--brass); color: #1a1408; font-weight: 600; }
+  .btn-ghost {
+    background: transparent;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    padding: 0.4rem 0.2rem;
+    min-height: auto;
+  }
+  .panel.ink .btn-ghost { color: var(--ink-fg-dim); }
+  .panel.paper .btn-ghost { color: var(--paper-fg-dim); }
+
+  .btn-row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; }
+
+  details.adv { font-size: 0.85rem; }
+  details.adv summary { cursor: pointer; font-family: var(--mono); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.7; padding: 0.4rem 0; min-height: 44px; display: flex; align-items: center; }
+  details.adv[open] summary { margin-bottom: 0.2rem; }
+
+  /* output views */
+  .output-stack { position: relative; }
+  .output-stack textarea { display: block; }
+  .reveal-view {
+    display: none;
+    font-family: var(--mono);
+    font-size: 15px;
+    line-height: 1.7;
+    padding: 0.75rem 0.85rem;
+    border-radius: var(--radius);
+    border: 1px solid;
+    min-height: 44px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .panel.ink .reveal-view { background: var(--ink-bg-raised); border-color: #33394a; }
+  .panel.paper .reveal-view { background: var(--paper-bg-raised); border-color: #cbbd97; }
+  .reveal-view.show { display: block; }
+  .output-stack textarea.hide-when-revealed { display: none; }
+  .tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    vertical-align: middle;
+    padding: 2px 4px;
+    border-radius: 3px;
+    background: rgba(200, 155, 60, 0.16);
+    border: 1px dashed var(--brass);
+  }
+  .tag-chip .bit { width: 2px; height: 10px; display: inline-block; border-radius: 1px; }
+  .tag-chip .bit.on { background: var(--brass); }
+  .tag-chip .bit.off { background: currentColor; opacity: 0.25; }
+
+  /* result card */
+  .result-card {
+    border-radius: var(--radius);
+    padding: 1rem 1.1rem;
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    display: none;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .result-card.show { display: flex; }
+  .result-card.verified { background: var(--verified-bg); border: 1px solid var(--verified); }
+  .result-card.unverified { background: var(--unverified-bg); border: 1px solid var(--unverified); }
+  .result-badge { display: inline-flex; align-items: center; gap: 0.4rem; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .result-badge.verified { color: var(--verified); }
+  .result-badge.unverified { color: var(--unverified); }
+  .result-card pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.82rem; }
+
+  canvas.barcode { width: 100%; height: 40px; display: block; border-radius: var(--radius); }
+  .barcode-wrap { display: none; flex-direction: column; gap: 0.35rem; }
+  .barcode-wrap.show { display: flex; }
+  .barcode-caption { font-family: var(--mono); font-size: 0.68rem; opacity: 0.6; }
+
+  .stat-row { display: flex; gap: 1rem; flex-wrap: wrap; font-family: var(--mono); font-size: 0.72rem; opacity: 0.75; }
+  .stat-row span { display: inline-flex; align-items: center; gap: 0.3rem; }
+
+  /* ---------- robustness lab ---------- */
+  .lab { background: var(--ink-bg); color: var(--ink-fg); padding: clamp(2rem, 6vw, 3rem) clamp(1.1rem, 4vw, 2.25rem); border-top: 3px solid var(--brass); }
+  .lab-inner { max-width: 1180px; margin: 0 auto; }
+  .lab h2 { font-family: var(--display); font-size: clamp(1.4rem, 4vw, 1.7rem); margin: 0 0 0.4rem; }
+  .lab p.hint { color: var(--ink-fg-dim); max-width: 60ch; margin: 0 0 1.75rem; font-size: 0.92rem; }
+
+  .lab-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.9rem; }
+  .lab-card { background: var(--ink-bg-raised); border: 1px solid #2a2f3b; border-radius: var(--radius-lg); padding: 1.1rem; display: flex; flex-direction: column; gap: 0.6rem; cursor: pointer; transition: border-color 0.15s ease, transform 0.1s ease; }
+  .lab-card:hover { border-color: var(--brass-dim); }
+  .lab-card:active { transform: scale(0.99); }
+  .lab-card h3 { font-family: var(--mono); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 0; font-weight: 500; }
+  .lab-card p { margin: 0; font-size: 0.82rem; color: var(--ink-fg-dim); flex: 1; }
+  .lab-status { font-family: var(--mono); font-size: 0.78rem; font-weight: 600; padding: 0.4rem 0.6rem; border-radius: var(--radius); display: inline-block; width: fit-content; min-height: auto; }
+  .lab-status.pending { background: #22262f; color: var(--ink-fg-dim); }
+  .lab-status.pass { background: var(--verified-bg); color: var(--verified); }
+  .lab-status.fail { background: var(--unverified-bg); color: var(--unverified); }
+  .lab-note { margin-top: 2.5rem; font-size: 0.82rem; color: var(--ink-fg-dim); max-width: 70ch; border-top: 1px solid #2a2f3b; padding-top: 1.25rem; }
+  .lab-note code { font-family: var(--mono); background: var(--ink-bg-raised); padding: 0.1rem 0.35rem; border-radius: 2px; }
+
+  footer { background: var(--paper-bg); text-align: center; padding: 2rem 1.25rem calc(2.5rem + env(safe-area-inset-bottom)); font-family: var(--mono); font-size: 0.76rem; color: var(--paper-fg-dim); }
+  footer code { background: var(--paper-bg-raised); padding: 0.15rem 0.4rem; border-radius: 2px; }
+  footer a { color: var(--brass-dim); }
+
+  /* ---------- toast ---------- */
+  .toast-stack {
+    position: fixed;
+    left: 50%;
+    bottom: calc(1.25rem + env(safe-area-inset-bottom));
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    z-index: 100;
+    width: min(92vw, 420px);
+    pointer-events: none;
+  }
+  .toast {
+    background: var(--ink-bg);
+    color: var(--ink-fg);
+    border: 1px solid var(--brass);
+    border-radius: var(--radius);
+    padding: 0.75rem 1rem;
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    opacity: 0;
+    transform: translateY(8px);
+    animation: toast-in 0.2s ease forwards, toast-out 0.2s ease 2.6s forwards;
+  }
+  @keyframes toast-in { to { opacity: 1; transform: translateY(0); } }
+  @keyframes toast-out { to { opacity: 0; transform: translateY(-6px); } }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; scroll-behavior: auto !important; animation-duration: 0.01ms !important; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <p class="eyebrow">a live playground</p>
+  <h1>slark <span class="khmer">ស្លាក — "tag"</span></h1>
+  <p class="lede">A hidden tag lives inside text you can't see, made of Unicode characters with <strong>zero visual width</strong>. Stamp one below. Check any text for one — including text you didn't stamp yourself.</p>
+</header>
+
+<div class="tabbar">
+  <div class="tabbar-inner" role="tablist" aria-label="Playground panels">
+    <button class="tab-btn" role="tab" id="tab-stamp" aria-selected="true" aria-controls="panel-encode">01 · Stamp</button>
+    <button class="tab-btn" role="tab" id="tab-check" aria-selected="false" aria-controls="panel-decode">02 · Check</button>
+  </div>
+</div>
+
+<main>
+  <div class="stage">
+    <section class="panel ink active" id="panel-encode">
+      <p class="panel-eyebrow"><span class="num">01</span> Stamp</p>
+      <h2>Hide a tag in text</h2>
+      <p class="hint">The output looks byte-for-byte identical to your input when displayed — the tag is invisible, not disguised.</p>
+
+      <div>
+        <label for="enc-text">Your text</label>
+        <textarea id="enc-text" rows="5" placeholder="Paste or write the text you want to tag…">This article discusses the future of renewable energy and its impact on global markets.</textarea>
+      </div>
+
+      <div class="field-row">
+        <div>
+          <label for="enc-model">Model / source</label>
+          <input class="mono" type="text" id="enc-model" placeholder="claude-sonnet-5" value="claude-sonnet-5" />
+        </div>
+        <div>
+          <label for="enc-generator">Generator tag</label>
+          <input class="mono" type="text" id="enc-generator" placeholder="ai" value="ai" />
+        </div>
+      </div>
+
+      <details class="adv">
+        <summary>Extra metadata (optional JSON)</summary>
+        <input class="mono" type="text" id="enc-extra" placeholder='{"session":"abc123"}' />
+      </details>
+
+      <button class="btn-primary" id="btn-encode">Stamp it →</button>
+
+      <div>
+        <div class="btn-row" style="justify-content: space-between; margin-bottom: 0.35rem;">
+          <label for="enc-output" style="margin-bottom:0;">Watermarked output</label>
+          <button class="btn-secondary" id="btn-reveal" aria-pressed="false">👁 Reveal hidden tag</button>
+        </div>
+        <div class="output-stack">
+          <textarea class="mono" id="enc-output" rows="5" readonly placeholder="Your tagged text will appear here…"></textarea>
+          <div class="reveal-view" id="enc-reveal-view"></div>
+        </div>
+      </div>
+
+      <div class="stat-row" id="enc-stats"></div>
+
+      <div class="barcode-wrap" id="enc-barcode-wrap">
+        <canvas class="barcode" id="enc-barcode"></canvas>
+        <p class="barcode-caption">↑ the hidden bitstream, drawn visible. brass = 1, dark = 0.</p>
+      </div>
+
+      <button class="btn-ghost" id="btn-copy-enc">Copy watermarked text</button>
+    </section>
+
+    <div class="seam" aria-hidden="true"></div>
+
+    <section class="panel paper" id="panel-decode">
+      <p class="panel-eyebrow"><span class="num">02</span> Check</p>
+      <h2>Look for a hidden tag</h2>
+      <p class="hint">Paste anything here — text from the Stamp panel, or from anywhere else entirely. This doesn't know or care where it came from.</p>
+
+      <div>
+        <label for="dec-text">Text to check</label>
+        <textarea class="mono" id="dec-text" rows="7" placeholder="Paste text here to check it for a hidden slark tag…"></textarea>
+      </div>
+
+      <button class="btn-primary" id="btn-decode">Check for a tag →</button>
+
+      <div class="result-card" id="dec-result">
+        <span class="result-badge" id="dec-badge"></span>
+        <pre id="dec-payload"></pre>
+      </div>
+
+      <div class="barcode-wrap" id="dec-barcode-wrap">
+        <canvas class="barcode" id="dec-barcode"></canvas>
+        <p class="barcode-caption">↑ the hidden bitstream found in this text.</p>
+      </div>
+
+      <button class="btn-ghost" id="btn-paste-from-left">↑ Pull in the stamped text from Stamp</button>
+    </section>
+  </div>
+</main>
+
+<section class="lab">
+  <div class="lab-inner">
+    <h2>Robustness lab</h2>
+    <p class="hint">An invisible tag only matters if it survives whatever happens to the text next. Stamp some text above, then tap each card below — every test is a real transformation applied to your actual watermarked text, not a guess.</p>
+
+    <div class="lab-grid" id="lab-grid">
+      <div class="lab-card" data-test="noop" role="button" tabindex="0">
+        <h3>No change</h3>
+        <p>Control group — the watermarked text, untouched. Should always pass.</p>
+        <span class="lab-status pending">Stamp text first</span>
+      </div>
+      <div class="lab-card" data-test="strip-zw" role="button" tabindex="0">
+        <h3>Zero-width filter</h3>
+        <p>Strips all zero-width Unicode characters — the behavior of some sanitizers and text-cleanup tools.</p>
+        <span class="lab-status pending">Stamp text first</span>
+      </div>
+      <div class="lab-card" data-test="nfkc" role="button" tabindex="0">
+        <h3>Unicode NFKC normalize</h3>
+        <p>Runs the text through standard Unicode compatibility normalization.</p>
+        <span class="lab-status pending">Stamp text first</span>
+      </div>
+      <div class="lab-card" data-test="html-roundtrip" role="button" tabindex="0">
+        <h3>HTML text-node round-trip</h3>
+        <p>Sets the text as a DOM text node's content, then reads it back out — simulates an HTML-based editor.</p>
+        <span class="lab-status pending">Stamp text first</span>
+      </div>
+      <div class="lab-card" data-test="retype" role="button" tabindex="0">
+        <h3>Manual retype</h3>
+        <p>Uses only the <em>visible</em> characters, as if a human read the text and typed it fresh.</p>
+        <span class="lab-status pending">Stamp text first</span>
+      </div>
+    </div>
+
+    <p class="lab-note">These are the mechanics as implemented here, tested against your actual text in your browser right now — not claims about what any specific product does. If you need certainty for a specific destination, test it directly with <code>slark.check()</code> after pasting the output back out.</p>
+  </div>
+</section>
+
+<footer>
+  pip install slark · <a href="https://github.com/im4tta/slark" target="_blank" rel="noopener">github.com/im4tta/slark</a><br>
+  This page reimplements the same bit-level format as the Python package, in JavaScript, so results match exactly.<br>
+  Detects only slark's own tag format — not watermarks from other AI systems or tools.
+</footer>
+
+<div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+<script>
+/* ============================================================
+   slark core — mirrors the Python core.py exactly:
+   ZWSP (U+200B) = bit 0, ZWNJ (U+200C) = bit 1,
+   ZWJ (U+200D)  = start/end sentinel.
+   Frame: [2-byte length][4-byte CRC32][JSON payload bytes]
+   ============================================================ */
+const ZW0 = '\u200b', ZW1 = '\u200c', SENTINEL = '\u200d';
+const MARK_CHARS = new Set([ZW0, ZW1, SENTINEL]);
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function bytesToBits(bytes) {
+  let bits = '';
+  for (const b of bytes) bits += b.toString(2).padStart(8, '0');
+  return bits;
+}
+function bitsToBytes(bits) {
+  const n = bits.length - (bits.length % 8);
+  const out = new Uint8Array(n / 8);
+  for (let i = 0; i < n; i += 8) out[i / 8] = parseInt(bits.slice(i, i + 8), 2);
+  return out;
+}
+function findInsertIndex(text) {
+  let idx = text.indexOf(' ');
+  if (idx === -1) idx = text.indexOf('\n');
+  return idx !== -1 ? idx + 1 : 0;
+}
+function slarkEncode(text, metadata) {
+  const json = JSON.stringify(metadata);
+  const payloadBytes = new TextEncoder().encode(json);
+  const checksum = crc32(payloadBytes);
+  const framed = new Uint8Array(6 + payloadBytes.length);
+  framed[0] = (payloadBytes.length >> 8) & 0xff;
+  framed[1] = payloadBytes.length & 0xff;
+  framed[2] = (checksum >>> 24) & 0xff;
+  framed[3] = (checksum >>> 16) & 0xff;
+  framed[4] = (checksum >>> 8) & 0xff;
+  framed[5] = checksum & 0xff;
+  framed.set(payloadBytes, 6);
+  const bits = bytesToBits(framed);
+  let body = '';
+  for (const b of bits) body += (b === '1') ? ZW1 : ZW0;
+  const zw = SENTINEL + body + SENTINEL;
+  const idx = findInsertIndex(text);
+  return { text: text.slice(0, idx) + zw + text.slice(idx), hiddenCharCount: zw.length, insertIdx: idx, zwLen: zw.length };
+}
+function slarkDecode(text) {
+  const start = text.indexOf(SENTINEL);
+  if (start === -1) return null;
+  const end = text.indexOf(SENTINEL, start + 1);
+  if (end === -1) return null;
+  const body = text.slice(start + 1, end);
+  let bits = '';
+  const bitChars = [];
+  for (const ch of body) {
+    if (ch === ZW1) { bits += '1'; bitChars.push(1); }
+    else if (ch === ZW0) { bits += '0'; bitChars.push(0); }
+  }
+  const raw = bitsToBytes(bits);
+  if (raw.length < 6) return null;
+  const plen = (raw[0] << 8) | raw[1];
+  const checksum = ((raw[2] << 24) | (raw[3] << 16) | (raw[4] << 8) | raw[5]) >>> 0;
+  const payloadBytes = raw.slice(6, 6 + plen);
+  if (payloadBytes.length !== plen) return null;
+  if (crc32(payloadBytes) !== checksum) return null;
+  try {
+    const meta = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes));
+    return { meta, bitChars, start, end };
+  } catch (e) { return null; }
+}
+function slarkStrip(text) { return [...text].filter(ch => !MARK_CHARS.has(ch)).join(''); }
+
+/* ---------------- barcode + inline reveal ---------------- */
+function drawBarcode(canvas, bitChars, dark) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 600;
+  const cssH = 40;
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, cssW, cssH);
+  const n = bitChars.length || 1;
+  const barW = Math.max(cssW / n, 0.6);
+  const onColor = '#c89b3c';
+  const offColor = dark ? '#262b36' : '#cbbd97';
+  for (let i = 0; i < bitChars.length; i++) {
+    ctx.fillStyle = bitChars[i] ? onColor : offColor;
+    ctx.fillRect(i * barW, 0, Math.ceil(barW), cssH);
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Render the marked text with the hidden run replaced by a visible inline chip
+// showing a compressed sample of the actual bits (max ~40 ticks, representative).
+function renderRevealHtml(markedText, decoded) {
+  if (!decoded) return escapeHtml(markedText);
+  const before = markedText.slice(0, decoded.start);
+  const after = markedText.slice(decoded.end + 1);
+  const bits = decoded.bitChars;
+  const maxTicks = 48;
+  const step = Math.max(1, Math.floor(bits.length / maxTicks));
+  let ticks = '';
+  for (let i = 0; i < bits.length; i += step) {
+    ticks += `<span class="bit ${bits[i] ? 'on' : 'off'}"></span>`;
+  }
+  const chip = `<span class="tag-chip" title="${bits.length} hidden bits here">${ticks}</span>`;
+  return escapeHtml(before) + chip + escapeHtml(after);
+}
+
+/* ---------------- toast ---------------- */
+function toast(msg) {
+  const stack = document.getElementById('toast-stack');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = msg;
+  stack.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+/* ---------------- UI wiring ---------------- */
+const $ = (id) => document.getElementById(id);
+
+function buildMetadata() {
+  const model = $('enc-model').value.trim();
+  const generator = $('enc-generator').value.trim() || 'ai';
+  const extraRaw = $('enc-extra').value.trim();
+  const meta = { g: generator, ts: Math.floor(Date.now() / 1000) };
+  if (model) meta.m = model;
+  if (extraRaw) {
+    try { Object.assign(meta, JSON.parse(extraRaw)); }
+    catch (e) { toast('Extra metadata isn\'t valid JSON — ignoring it.'); }
+  }
+  return meta;
+}
+
+let lastEncoded = '';
+let revealOn = false;
+
+function updateRevealView() {
+  const view = $('enc-reveal-view');
+  const textarea = $('enc-output');
+  if (!revealOn) {
+    view.classList.remove('show');
+    textarea.classList.remove('hide-when-revealed');
+    return;
+  }
+  const decoded = slarkDecode(lastEncoded);
+  view.innerHTML = renderRevealHtml(lastEncoded, decoded);
+  view.classList.add('show');
+  textarea.classList.add('hide-when-revealed');
+}
+
+$('btn-reveal').addEventListener('click', () => {
+  revealOn = !revealOn;
+  $('btn-reveal').classList.toggle('on', revealOn);
+  $('btn-reveal').setAttribute('aria-pressed', String(revealOn));
+  $('btn-reveal').textContent = revealOn ? '👁 Showing hidden tag' : '👁 Reveal hidden tag';
+  updateRevealView();
+});
+
+$('btn-encode').addEventListener('click', () => {
+  const input = $('enc-text').value;
+  const meta = buildMetadata();
+  const { text, hiddenCharCount } = slarkEncode(input, meta);
+  lastEncoded = text;
+  $('enc-output').value = text;
+
+  const decoded = slarkDecode(text);
+  $('enc-stats').innerHTML = `
+    <span>${hiddenCharCount} hidden chars</span>
+    <span>${new Blob([JSON.stringify(meta)]).size} payload bytes</span>
+    <span style="color:var(--verified)">checksum ✓</span>
+  `;
+  $('enc-barcode-wrap').classList.add('show');
+  drawBarcode($('enc-barcode'), decoded.bitChars, true);
+  updateRevealView();
+});
+
+$('btn-copy-enc').addEventListener('click', async () => {
+  if (!$('enc-output').value) return;
+  try {
+    await navigator.clipboard.writeText($('enc-output').value);
+    toast('Copied watermarked text to clipboard.');
+  } catch (e) { toast('Couldn\'t access the clipboard — select and copy manually.'); }
+});
+
+$('btn-paste-from-left').addEventListener('click', () => {
+  if (!lastEncoded) { toast('Stamp some text first.'); return; }
+  $('dec-text').value = lastEncoded;
+  if (window.innerWidth <= 880) toast('Pulled in — now tap "Check for a tag".');
+});
+
+function runDecode(text) {
+  const result = slarkDecode(text);
+  const card = $('dec-result');
+  const badge = $('dec-badge');
+  const payload = $('dec-payload');
+  const wrap = $('dec-barcode-wrap');
+
+  card.classList.add('show');
+  if (result) {
+    card.classList.remove('unverified'); card.classList.add('verified');
+    badge.classList.remove('unverified'); badge.classList.add('verified');
+    badge.textContent = '● Tag found — checksum verified';
+    payload.textContent = JSON.stringify(result.meta, null, 2);
+    wrap.classList.add('show');
+    drawBarcode($('dec-barcode'), result.bitChars, false);
+  } else {
+    card.classList.remove('verified'); card.classList.add('unverified');
+    badge.classList.remove('verified'); badge.classList.add('unverified');
+    badge.textContent = '● No valid tag found';
+    payload.textContent = 'This text has no slark watermark, or it was corrupted/truncated enough that the checksum no longer matches.';
+    wrap.classList.remove('show');
+  }
+  return result;
+}
+$('btn-decode').addEventListener('click', () => runDecode($('dec-text').value));
+
+/* ---------------- mobile tabs ---------------- */
+const tabStamp = $('tab-stamp'), tabCheck = $('tab-check');
+const panelEncode = $('panel-encode'), panelDecode = $('panel-decode');
+function setTab(which) {
+  const stampOn = which === 'stamp';
+  tabStamp.setAttribute('aria-selected', String(stampOn));
+  tabCheck.setAttribute('aria-selected', String(!stampOn));
+  panelEncode.classList.toggle('active', stampOn);
+  panelDecode.classList.toggle('active', !stampOn);
+}
+tabStamp.addEventListener('click', () => setTab('stamp'));
+tabCheck.addEventListener('click', () => setTab('check'));
+
+/* ---------------- robustness lab ---------------- */
+const labTests = {
+  'noop': (text) => text,
+  'strip-zw': (text) => slarkStrip(text),
+  'nfkc': (text) => text.normalize('NFKC'),
+  'html-roundtrip': (text) => {
+    const node = document.createTextNode(text);
+    const div = document.createElement('div');
+    div.appendChild(node);
+    return div.textContent;
+  },
+  'retype': (text) => slarkStrip(text),
+};
+document.querySelectorAll('.lab-card').forEach(card => {
+  const testKey = card.dataset.test;
+  const statusEl = card.querySelector('.lab-status');
+  const run = () => {
+    if (!lastEncoded) { statusEl.textContent = 'Stamp text first'; statusEl.className = 'lab-status pending'; return; }
+    const result = slarkDecode(labTests[testKey](lastEncoded));
+    if (result) { statusEl.textContent = '✓ Tag survived'; statusEl.className = 'lab-status pass'; }
+    else { statusEl.textContent = '✗ Tag lost'; statusEl.className = 'lab-status fail'; }
+  };
+  card.addEventListener('click', run);
+  card.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); run(); } });
+});
+
+// run the first encode on load so the page isn't empty
+$('btn-encode').click();
+</script>
+
+</body>
+</html>
