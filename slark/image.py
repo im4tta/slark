@@ -19,7 +19,9 @@ browser decode here and vice versa:
 
   Layout derivation uses only the image's capacity and fixed constants,
   never the payload size alone, so encoder and decoder agree without
-  communicating.
+  communicating. (Because a frame can never exceed the reserved slot size,
+  the chunk layout is identical for every payload — which also means
+  re-encoding an already-tagged image cleanly overwrites the old tag.)
 
 This shares text watermarking's honesty: LSB tags are invisible but die
 on any lossy re-encode (JPEG, WebP, screenshots, platform re-uploads).
@@ -28,7 +30,9 @@ Save and share as PNG end-to-end.
 Public API:
     encode(source, metadata=None, **kwargs) -> PIL.Image.Image
     decode(source) -> dict | None
+    decode_info(source) -> (dict, copy_index, total_copies) | None
     has_watermark(source) -> bool
+    erase(source) -> PIL.Image.Image
 
 Requires Pillow: pip install "slark[image]"
 """
@@ -72,6 +76,14 @@ def _load(source):
     return img, had_alpha
 
 
+def _to_rgba_bytes(source):
+    """Load `source` and return (bytearray RGBA pixels, width, height, had_alpha)."""
+    img, had_alpha = _load(source)
+    rgba = img.convert("RGBA")
+    w, h = rgba.size
+    return bytearray(rgba.tobytes()), w, h, had_alpha
+
+
 def _frame_for(payload_json: bytes) -> bytes:
     if not 0 < len(payload_json) <= MAX_PAYLOAD:
         raise ValueError(
@@ -92,6 +104,11 @@ def _copies_for(total_slots: int, frame_bits: int) -> int:
     return min(MAX_COPIES, total_slots // need)
 
 
+def _slot_index(pos: int) -> int:
+    """Map a bit-slot position to its byte index in RGBA pixel data."""
+    return (pos // 3) * 4 + (pos % 3)
+
+
 def encode(
     source,
     metadata: Optional[dict] = None,
@@ -102,6 +119,9 @@ def encode(
     extra: Optional[dict] = None,
 ):
     """Embed an invisible SLK1 tag into an image.
+
+    Re-encoding an already-tagged image overwrites the previous tag —
+    the chunk layout depends only on image capacity, never payload size.
 
     Args:
         source: path, file-like object, or PIL.Image.Image.
@@ -127,10 +147,7 @@ def encode(
     payload_json = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     frame = _frame_for(payload_json)
 
-    img, had_alpha = _load(source)
-    rgba = img.convert("RGBA")
-    width, height = rgba.size
-    raw = bytearray(rgba.tobytes())
+    raw, width, height, had_alpha = _to_rgba_bytes(source)
 
     total_slots = width * height * 3
     frame_bits = len(frame) * 8
@@ -138,19 +155,29 @@ def encode(
     if copies < 1:
         raise ValueError("image has too few pixels to hold a tag")
 
+    # Precompute each frame bit once; reuse across every copy.
+    frame_bit_values = [
+        (frame[b >> 3] >> (7 - (b & 7))) & 1 for b in range(frame_bits)
+    ]
     chunk = total_slots // copies
     for c in range(copies):
         base = c * chunk
-        for b in range(frame_bits):
-            pos = base + b
-            idx = (pos // 3) * 4 + (pos % 3)
-            want = (frame[b >> 3] >> (7 - (b & 7))) & 1
+        for b, want in enumerate(frame_bit_values):
+            idx = _slot_index(base + b)
             raw[idx] = (raw[idx] & 0xFE) | want
 
     out = Image.frombytes("RGBA", (width, height), bytes(raw))
     if not had_alpha:
         out = out.convert("RGB")
     return out
+
+
+def _read_bytes(raw, base: int, count: int) -> bytes:
+    out = bytearray(count)
+    for b in range(count * 8):
+        pos = base + b
+        out[b >> 3] |= (raw[(pos // 3) * 4 + (pos % 3)] & 1) << (7 - (b & 7))
+    return bytes(out)
 
 
 def _decode_raw(raw: bytearray, width: int, height: int):
@@ -161,16 +188,9 @@ def _decode_raw(raw: bytearray, width: int, height: int):
         return None
     chunk = total_slots // copies
 
-    def read_bytes(base: int, count: int) -> bytes:
-        out = bytearray(count)
-        for b in range(count * 8):
-            pos = base + b
-            out[b >> 3] |= (raw[(pos // 3) * 4 + (pos % 3)] & 1) << (7 - (b & 7))
-        return bytes(out)
-
     for c in range(copies):
         base = c * chunk
-        hdr = read_bytes(base, HDR_BYTES)
+        hdr = _read_bytes(raw, base, HDR_BYTES)
         if hdr[:4] != MAGIC:
             continue
         plen = int.from_bytes(hdr[4:6], "big")
@@ -178,7 +198,7 @@ def _decode_raw(raw: bytearray, width: int, height: int):
             continue
         if (HDR_BYTES + plen) * 8 > chunk:
             continue
-        frame = read_bytes(base, HDR_BYTES + plen)
+        frame = _read_bytes(raw, base, HDR_BYTES + plen)
         stored = int.from_bytes(frame[6:10], "big")
         payload_json = frame[HDR_BYTES:]
         if (zlib.crc32(payload_json) & 0xFFFFFFFF) != stored:
@@ -186,6 +206,8 @@ def _decode_raw(raw: bytearray, width: int, height: int):
         try:
             meta = json.loads(payload_json.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(meta, dict):
             continue
         return meta, c, copies
     return None
@@ -201,29 +223,47 @@ def decode(source) -> Optional[dict]:
         The metadata dict if a valid, checksum-verified tag is found,
         otherwise None.
     """
-    Image = _require_pil()
-    if isinstance(source, Image.Image):
-        img = source
-    else:
-        img = Image.open(source)
-    rgba = img.convert("RGBA")
-    raw = bytearray(rgba.tobytes())
-    found = _decode_raw(raw, rgba.size[0], rgba.size[1])
+    raw, w, h, _ = _to_rgba_bytes(source)
+    found = _decode_raw(raw, w, h)
     return found[0] if found else None
 
 
 def decode_info(source):
     """Like decode(), but returns (metadata, copy_index, total_copies) or None."""
-    Image = _require_pil()
-    if isinstance(source, Image.Image):
-        img = source
-    else:
-        img = Image.open(source)
-    rgba = img.convert("RGBA")
-    raw = bytearray(rgba.tobytes())
-    return _decode_raw(raw, rgba.size[0], rgba.size[1])
+    raw, w, h, _ = _to_rgba_bytes(source)
+    return _decode_raw(raw, w, h)
 
 
 def has_watermark(source) -> bool:
     """Fast check: is there a verifiable SLK1 tag present?"""
     return decode(source) is not None
+
+
+def erase(source):
+    """Remove any SLK1 tag by scrubbing the magic bytes of every chunk.
+
+    Only the 32 magic-bit slots at the start of each chunk are touched
+    (their LSBs are zeroed), so at most 32 sub-pixel values per chunk shift
+    by 1/255 — visually nothing, but no decoder can find a frame afterwards.
+
+    Returns:
+        A new PIL.Image.Image (RGB, or RGBA if the source had alpha).
+    """
+    Image = _require_pil()
+    raw, width, height, had_alpha = _to_rgba_bytes(source)
+
+    total_slots = width * height * 3
+    copies = _copies_for(total_slots, RESERVE_BITS)
+    if copies >= 1:
+        chunk = total_slots // copies
+        magic_bits = len(MAGIC) * 8
+        for c in range(copies):
+            base = c * chunk
+            for b in range(magic_bits):
+                idx = _slot_index(base + b)
+                raw[idx] &= 0xFE
+
+    out = Image.frombytes("RGBA", (width, height), bytes(raw))
+    if not had_alpha:
+        out = out.convert("RGB")
+    return out

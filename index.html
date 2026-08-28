@@ -611,6 +611,11 @@
         <p>Sets the text as a DOM text node's content, then reads it back out — simulates an HTML-based editor.</p>
         <span class="lab-status pending">Stamp text first</span>
       </div>
+      <div class="lab-card" data-test="emoji" role="button" tabindex="0">
+        <h3>Emoji ZWJ neighbors</h3>
+        <p>Surrounds the text with 👨‍👩‍👧 and 🏳️‍🌈 — emoji built from the same joiner character the tag uses. The checksum-scanning decoder must not be fooled.</p>
+        <span class="lab-status pending">Stamp text first</span>
+      </div>
       <div class="lab-card" data-test="retype" role="button" tabindex="0">
         <h3>Manual retype</h3>
         <p>Uses only the <em>visible</em> characters, as if a human read the text and typed it fresh.</p>
@@ -722,11 +727,8 @@ function slakEncode(text, metadata) {
   const idx = findInsertIndex(text);
   return { text: text.slice(0, idx) + zw + text.slice(idx), hiddenCharCount: zw.length };
 }
-function slakDecode(text) {
-  const start = text.indexOf(SENTINEL);
-  if (start === -1) return null;
-  const end = text.indexOf(SENTINEL, start + 1);
-  if (end === -1) return null;
+function tryParseSpan(text, start, end) {
+  // Attempt to decode the span between two sentinel indices (exclusive).
   const body = text.slice(start + 1, end);
   let bits = '';
   const bitChars = [];
@@ -743,10 +745,41 @@ function slakDecode(text) {
   if (crc32(payloadBytes) !== checksum) return null;
   try {
     const meta = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes));
+    if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return null;
     return { meta, bitChars, start, end };
   } catch (e) { return null; }
 }
-function slakStrip(text) { return [...text].filter(ch => !MARK_CHARS.has(ch)).join(''); }
+function slakScan(text) {
+  // Scan EVERY consecutive sentinel pair, not just the first — U+200D also
+  // appears in legitimate emoji ZWJ sequences (👨‍👩‍👧), which must never
+  // poison decoding. Only checksum-verified spans are accepted.
+  const idxs = [];
+  for (let i = 0; i < text.length; i++) if (text[i] === SENTINEL) idxs.push(i);
+  const found = [];
+  let usedUntil = -1;
+  for (let k = 0; k + 1 < idxs.length; k++) {
+    const a = idxs[k], b = idxs[k + 1];
+    if (a <= usedUntil) continue;
+    const res = tryParseSpan(text, a, b);
+    if (res) { usedUntil = b; found.push(res); }
+  }
+  return found;
+}
+function slakDecode(text) {
+  const found = slakScan(text);
+  return found.length ? found[0] : null;
+}
+function slakStrip(text) {
+  // Safe strip: remove verified watermark spans exactly, then any stray
+  // bit characters — but keep the ZWJs that hold emoji together.
+  const found = slakScan(text);
+  let out = '';
+  let prev = 0;
+  for (const f of found) { out += text.slice(prev, f.start); prev = f.end + 1; }
+  out += text.slice(prev);
+  return [...out].filter(ch => ch !== ZW0 && ch !== ZW1).join('');
+}
+function slakStripAggressive(text) { return [...text].filter(ch => !MARK_CHARS.has(ch)).join(''); }
 
 /* ============================================================
    Slark core (image) — playground-native LSB format:
@@ -1210,7 +1243,7 @@ for (const [key, ref] of Object.entries(TABS)) {
 /* ---------------- text robustness lab ---------------- */
 const labTests = {
   'noop': (text) => text,
-  'strip-zw': (text) => slakStrip(text),
+  'strip-zw': (text) => slakStripAggressive(text),
   'nfkc': (text) => text.normalize('NFKC'),
   'html-roundtrip': (text) => {
     const node = document.createTextNode(text);
@@ -1218,7 +1251,8 @@ const labTests = {
     div.appendChild(node);
     return div.textContent;
   },
-  'retype': (text) => slakStrip(text),
+  'emoji': (text) => '👨\u200d👩\u200d👧 ' + text + ' 🏳️\u200d🌈',
+  'retype': (text) => slakStripAggressive(text),
 };
 document.querySelectorAll('#lab-grid .lab-card').forEach(card => {
   const testKey = card.dataset.test;
