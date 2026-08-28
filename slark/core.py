@@ -24,15 +24,29 @@ never break decoding. Likewise ``strip()`` removes only verified watermark
 spans (plus stray bit characters), never the ZWJs that hold an emoji
 together.
 
-This is invisible-to-the-eye but NOT cryptographically secure and NOT
-guaranteed to survive aggressive re-formatting (e.g. pasting into a system
-that strips zero-width characters, OCR, or manual retyping). It's meant for
-lightweight, low-friction provenance marking — not tamper-proof DRM.
+Optional authenticity (v0.3): pass ``key=`` to ``encode()`` and the payload
+gains a ``sig`` field — a truncated HMAC-SHA256 over the canonical JSON of
+the other fields. ``verify(text, key)`` then distinguishes three states:
+    "signed"   — mark present, signature valid for this key
+    "invalid"  — mark present, has a sig that does NOT match this key
+                 (forged, tampered, or wrong key)
+    "unsigned" — mark present but carries no signature
+    "none"     — no mark at all
+The CRC32 protects against *accidental* corruption; the HMAC protects
+against *deliberate* forgery — someone who doesn't hold the key cannot
+mint a mark that verifies.
+
+This remains invisible-to-the-eye but NOT guaranteed to survive aggressive
+re-formatting (systems that strip zero-width characters, OCR, retyping).
+It's lightweight provenance marking — not tamper-proof DRM.
 
 Public API:
-    encode(text, metadata=None, *, replace=False, **kwargs) -> str
+    encode(text, metadata=None, *, key=None, replace=False, **kwargs) -> str
     decode(text) -> dict | None
     decode_all(text) -> list[dict]
+    verify(text, key) -> str            ("signed"|"invalid"|"unsigned"|"none")
+    verify_meta(meta, key) -> bool
+    sign_metadata(meta, key) -> dict
     has_watermark(text) -> bool
     strip(text, aggressive=False) -> str
     count_hidden_chars(text) -> int
@@ -40,10 +54,12 @@ Public API:
 
 from __future__ import annotations
 
+import hashlib
+import hmac as _hmac
 import json
 import time
 import zlib
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple, Union
 
 ZW0 = "\u200b"  # zero width space      -> bit 0
 ZW1 = "\u200c"  # zero width non-joiner -> bit 1
@@ -55,6 +71,12 @@ _BIT_CHARS = {ZW0, ZW1}
 # Frame: [2B payload length (BE)][4B CRC32 of payload (BE)][payload JSON]
 _HDR_BYTES = 6
 MAX_PAYLOAD = 0xFFFF  # hard limit imposed by the 2-byte length prefix
+
+SIG_FIELD = "sig"
+SIG_BYTES = 8  # truncated HMAC-SHA256 -> 16 hex chars
+
+
+# ---------------------------------------------------------------- bits
 
 
 def _bytes_to_bits(data: bytes) -> str:
@@ -83,6 +105,9 @@ def _find_insert_index(text: str) -> int:
     if idx == -1:
         idx = text.find("\n")
     return idx + 1 if idx != -1 else 0
+
+
+# ---------------------------------------------------------------- payload
 
 
 def _serialize_payload(metadata: dict) -> bytes:
@@ -145,6 +170,63 @@ def _scan(text: str) -> Iterator[Tuple[dict, int, int]]:
             yield meta, a, b
 
 
+# ---------------------------------------------------------------- signing
+
+
+def _key_bytes(key: Union[str, bytes]) -> bytes:
+    return key.encode("utf-8") if isinstance(key, str) else bytes(key)
+
+
+def _compute_sig(meta_without_sig: dict, key: Union[str, bytes]) -> str:
+    """Truncated HMAC-SHA256 (hex) over the canonical compact JSON of the
+    metadata *excluding* the sig field, preserving key insertion order —
+    identical bytes in Python and JavaScript, so signatures interoperate."""
+    msg = _serialize_payload(meta_without_sig)
+    digest = _hmac.new(_key_bytes(key), msg, hashlib.sha256).digest()
+    return digest[:SIG_BYTES].hex()
+
+
+def sign_metadata(metadata: dict, key: Union[str, bytes]) -> dict:
+    """Return a copy of `metadata` with a truncated-HMAC ``sig`` field
+    appended (always last, so verification re-serializes identically)."""
+    base = {k: v for k, v in metadata.items() if k != SIG_FIELD}
+    signed = dict(base)
+    signed[SIG_FIELD] = _compute_sig(base, key)
+    return signed
+
+
+def verify_meta(metadata: Optional[dict], key: Union[str, bytes]) -> bool:
+    """True iff `metadata` carries a ``sig`` that matches this key."""
+    if not isinstance(metadata, dict) or SIG_FIELD not in metadata:
+        return False
+    sig = metadata[SIG_FIELD]
+    if not isinstance(sig, str):
+        return False
+    base = {k: v for k, v in metadata.items() if k != SIG_FIELD}
+    expected = _compute_sig(base, key)
+    return _hmac.compare_digest(expected, sig)
+
+
+def verify(text: str, key: Union[str, bytes]) -> str:
+    """Classify the first mark in `text` against `key`.
+
+    Returns one of:
+        "signed"   — mark present, signature valid for this key
+        "invalid"  — mark present with a sig that does not match this key
+        "unsigned" — mark present but has no sig field
+        "none"     — no verifiable mark found
+    """
+    meta = decode(text)
+    if meta is None:
+        return "none"
+    if SIG_FIELD not in meta:
+        return "unsigned"
+    return "signed" if verify_meta(meta, key) else "invalid"
+
+
+# ---------------------------------------------------------------- metadata
+
+
 def _default_metadata(
     metadata: Optional[dict],
     model: Optional[str],
@@ -162,6 +244,9 @@ def _default_metadata(
     return meta
 
 
+# ---------------------------------------------------------------- public
+
+
 def encode(
     text: str,
     metadata: Optional[dict] = None,
@@ -171,6 +256,7 @@ def encode(
     timestamp: Optional[int] = None,
     extra: Optional[dict] = None,
     replace: bool = False,
+    key: Optional[Union[str, bytes]] = None,
 ) -> str:
     """Embed an invisible watermark into `text`.
 
@@ -184,6 +270,8 @@ def encode(
         extra: any additional fields to merge into the payload.
         replace: if True, remove any existing verified watermark(s) before
             embedding, so the text carries exactly one mark.
+        key: optional secret; when given, an HMAC-SHA256 ``sig`` field is
+            added so ``verify(text, key)`` can authenticate the mark.
 
     Returns:
         The watermarked text (visually identical to the input).
@@ -192,6 +280,8 @@ def encode(
         ValueError: if the serialized payload exceeds 65535 bytes.
     """
     metadata = _default_metadata(metadata, model, generator, timestamp, extra)
+    if key is not None:
+        metadata = sign_metadata(metadata, key)
     if replace:
         text = strip(text)
 

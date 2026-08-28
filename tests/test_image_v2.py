@@ -71,8 +71,8 @@ def test_reencode_overwrites_previous_tag():
     second = imgmod.encode(first, metadata={"v": 2})
     assert imgmod.decode(second) == {"v": 2}
     # every redundant copy must agree — scan info shows the first copy wins
-    meta, idx, _total = imgmod.decode_info(second)
-    assert meta == {"v": 2} and idx == 0
+    info = imgmod.decode_info(second)
+    assert info.metadata == {"v": 2} and info.copy_index == 0
 
 
 # ---------- fail-closed ----------

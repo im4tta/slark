@@ -7,6 +7,14 @@ slark — invisible text watermarking, for marking AI-generated content
     >>> slark.decode(marked)
     {'g': 'ai', 'ts': 1234567890, 'm': 'claude-sonnet-5'}
 
+Signed marks (forge-resistant with a shared secret):
+
+    >>> marked = slark.encode("Hello world", model="gpt-5", key="team-secret")
+    >>> slark.verify(marked, "team-secret")
+    'signed'
+    >>> slark.verify(marked, "wrong-key")
+    'invalid'
+
 Image tagging (requires ``pip install "slark[image]"``):
 
     >>> from slark import image
@@ -20,15 +28,21 @@ from .core import (
     decode_all,
     encode,
     has_watermark,
+    sign_metadata,
     strip,
     count_hidden_chars,
+    verify,
+    verify_meta,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "encode",
     "decode",
     "decode_all",
+    "verify",
+    "verify_meta",
+    "sign_metadata",
     "has_watermark",
     "strip",
     "count_hidden_chars",

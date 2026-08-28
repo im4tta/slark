@@ -95,9 +95,9 @@ def test_single_copy_corruption_still_decodes_via_redundancy():
 
     found = imgmod._decode_raw(raw, 200, 150)
     assert found is not None
-    meta, idx, total = found
-    assert meta == {"k": "v"}
-    assert idx > 0 and total == copies
+    assert found.metadata == {"k": "v"}
+    assert found.copy_index > 0 and found.total_copies == copies
+    assert found.via_vote is False
 
 
 def test_all_copies_corrupted_returns_none():

@@ -4,17 +4,20 @@ cli.py — command-line interface for slark
 
 Usage:
     # Text
-    slark encode --text "Hello world" --model claude-sonnet-5
+    slark encode --text "Hello world" --model claude-sonnet-5 [--key SECRET]
     slark encode --file input.txt --model claude-sonnet-5 --output out.txt
     slark decode --file out.txt [--json]
+    slark verify --file out.txt --key SECRET   # exit 0=signed, 1=not
     slark check --file out.txt          # exit code 0 = watermarked, 1 = not
     slark strip --file out.txt --output clean.txt [--aggressive]
 
     # Images (requires slark[image])
-    slark encode-image --file photo.png --model claude-sonnet-5 --output out.png
-    slark decode-image --file out.png [--json]
+    slark encode-image --file photo.png --model claude-sonnet-5 [--key SECRET]
+    slark decode-image --file out.png [--json] [--no-vote]
+    slark verify-image --file out.png --key SECRET
     slark check-image --file out.png    # exit code 0 = watermarked, 1 = not
     slark strip-image --file out.png --output clean.png
+    slark capacity --file photo.png     # tag capacity report
 
     Text subcommands also read stdin when neither --text nor --file is given:
         echo "Hello world" | slark encode --model gpt-5 | slark decode
@@ -70,6 +73,7 @@ def cmd_encode(args):
         generator=args.generator,
         extra=_parse_extra(args),
         replace=args.replace,
+        key=args.key,
     )
     _write_output(args, result)
 
@@ -96,6 +100,13 @@ def cmd_check(args):
     sys.exit(1)
 
 
+def cmd_verify(args):
+    text = _read_input(args)
+    status = wm.verify(text, args.key)
+    print(status)
+    sys.exit(0 if status == "signed" else 1)
+
+
 def cmd_strip(args):
     text = _read_input(args)
     _write_output(args, wm.strip(text, aggressive=args.aggressive))
@@ -117,7 +128,8 @@ def _image_module():
 def cmd_encode_image(args):
     imgmod = _image_module()
     marked = imgmod.encode(
-        args.file, model=args.model, generator=args.generator, extra=_parse_extra(args)
+        args.file, model=args.model, generator=args.generator,
+        extra=_parse_extra(args), key=args.key,
     )
     out = args.output or "slarked.png"
     marked.save(out, format="PNG")
@@ -126,22 +138,39 @@ def cmd_encode_image(args):
 
 def cmd_decode_image(args):
     imgmod = _image_module()
-    found = imgmod.decode_info(args.file)
+    found = imgmod.decode_info(args.file, vote=not args.no_vote)
     if found is None:
         if args.json:
             print("null")
         else:
             print("No valid watermark found.", file=sys.stderr)
         sys.exit(1)
-    meta, copy_index, total_copies = found
     if args.json:
         print(json.dumps(
-            {"metadata": meta, "copy_index": copy_index, "total_copies": total_copies},
+            {"metadata": found.metadata, "copy_index": found.copy_index,
+             "total_copies": found.total_copies, "via_vote": found.via_vote},
             ensure_ascii=False,
         ))
     else:
-        print(json.dumps(meta, indent=2, ensure_ascii=False))
-        print(f"(verified copy {copy_index + 1} of {total_copies})", file=sys.stderr)
+        print(json.dumps(found.metadata, indent=2, ensure_ascii=False))
+        how = ("reconstructed by majority vote across all copies"
+               if found.via_vote
+               else f"verified copy {found.copy_index + 1} of {found.total_copies}")
+        print(f"({how})", file=sys.stderr)
+
+
+def cmd_verify_image(args):
+    imgmod = _image_module()
+    status = imgmod.verify(args.file, args.key)
+    print(status)
+    sys.exit(0 if status == "signed" else 1)
+
+
+def cmd_capacity(args):
+    imgmod = _image_module()
+    info = imgmod.capacity(args.file)
+    print(json.dumps(info, indent=None if args.json else 2))
+    sys.exit(0 if info["taggable"] else 1)
 
 
 def cmd_check_image(args):
@@ -184,6 +213,7 @@ def build_parser():
         sp.add_argument("--model", help="Model name/id to embed, e.g. claude-sonnet-5")
         sp.add_argument("--generator", default="ai", help="Generator tag, default 'ai'")
         sp.add_argument("--extra", help="Extra metadata as a JSON object string")
+        sp.add_argument("--key", help="Secret key: adds an HMAC signature ('sig' field)")
 
     sp = sub.add_parser("encode", help="Embed a watermark in text")
     add_io_args(sp)
@@ -202,6 +232,11 @@ def build_parser():
     add_io_args(sp)
     sp.set_defaults(func=cmd_check)
 
+    sp = sub.add_parser("verify", help="Verify a mark's HMAC signature against a key")
+    add_io_args(sp)
+    sp.add_argument("--key", required=True, help="Secret key to verify against")
+    sp.set_defaults(func=cmd_verify)
+
     sp = sub.add_parser("strip", help="Remove watermark, output clean text")
     add_io_args(sp)
     sp.add_argument("--aggressive", action="store_true",
@@ -217,7 +252,19 @@ def build_parser():
     sp = sub.add_parser("decode-image", help="Extract tag metadata from an image")
     sp.add_argument("--file", required=True, help="Path to image to decode")
     sp.add_argument("--json", action="store_true", help="Machine-readable single-line JSON")
+    sp.add_argument("--no-vote", action="store_true",
+                    help="Disable majority-vote reconstruction fallback")
     sp.set_defaults(func=cmd_decode_image)
+
+    sp = sub.add_parser("verify-image", help="Verify an image tag's HMAC signature")
+    sp.add_argument("--file", required=True, help="Path to image to verify")
+    sp.add_argument("--key", required=True, help="Secret key to verify against")
+    sp.set_defaults(func=cmd_verify_image)
+
+    sp = sub.add_parser("capacity", help="Report an image's tag capacity")
+    sp.add_argument("--file", required=True, help="Path to image")
+    sp.add_argument("--json", action="store_true", help="Single-line JSON")
+    sp.set_defaults(func=cmd_capacity)
 
     sp = sub.add_parser("check-image", help="Check if an image carries a tag (exit code)")
     sp.add_argument("--file", required=True, help="Path to image to check")
