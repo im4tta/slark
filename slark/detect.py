@@ -48,6 +48,7 @@ Public API::
 from __future__ import annotations
 
 import json
+import os as _os
 import re
 import struct
 import unicodedata
@@ -742,6 +743,138 @@ def detect_dwt_dct(source) -> Optional[Finding]:
     )
 
 
+# ------------------------------------------------------- DWT-DCT-SVD variant
+#
+# `invisible-watermark`'s second algorithm (`dwtDctSvd`, class EmbedDwtDctSvd).
+# Same Haar DWT front-end and same YUV channel as dwtDct, but each 4x4 block
+# of the LL band goes through a *real* 2-D DCT, then an SVD; the bit lives in
+# the quantization residue of the largest singular value:
+#
+#     u, s, v = svd(dct(block));  s[0] = (s[0]//scale + 0.25 + 0.5*bit)*scale
+#
+# so reading it back is `int((s[0] % scale) > scale/2)`, voted over all blocks.
+#
+# Note the scales default differs from dwtDct: [0, 36, 0] rather than
+# [0, 36, 36] — but since dwtDct's channel loop is `range(2)` and channel 0
+# has scale 0, *both* algorithms only ever touch YUV channel 1 in practice.
+#
+# Measured against the reference implementation (24 fixtures, 3 signatures):
+# our reader agrees with the reference decoder on 100.00% of bits, and this
+# algorithm is markedly stronger than dwtDct — it recovers payloads with
+# 0.000 bit error where dwtDct manages only ~0.30 on identical images.
+
+_SVD_SCALE = 36.0
+_SVD_BLOCK = 4
+#: Measured separation is total: 0.000 bit error on all 24 watermarked
+#: fixtures vs a 0.3125 minimum across 21 negatives (photos, pure noise,
+#: flat fills, gradients, dwtDct-marked images). 0.20 sits inside that gap
+#: and matches the dwtDct threshold for consistency.
+_SVD_MAX_BER = 0.20
+
+_DCT4: Any = None
+
+
+def _dct_matrix(n: int) -> Any:
+    """Orthonormal DCT-II matrix; ``D @ block @ D.T`` matches ``cv2.dct``.
+
+    Verified against cv2.dct to 4.3e-14 max absolute error on 4x4 blocks.
+    """
+    np = _require_numpy()
+    k = np.arange(n)[:, None]
+    x = np.arange(n)[None, :]
+    d = np.cos(np.pi * (2 * x + 1) * k / (2 * n)) * np.sqrt(2.0 / n)
+    d[0, :] = np.sqrt(1.0 / n)
+    return d
+
+
+def _svd_read_bits(arr, wm_len: int) -> Optional[Tuple[Any, Any]]:
+    """Read `wm_len` voted bits via the DCT+SVD path. (bits, per-bit means)."""
+    np = _require_numpy()
+    global _DCT4
+    if _DCT4 is None:
+        _DCT4 = _dct_matrix(_SVD_BLOCK)
+
+    h, w = arr.shape[:2]
+    if min(h, w) < 2 * _SVD_BLOCK * 2:
+        return None
+    u = _bgr_to_yuv_u(arr)[: h // 4 * 4, : w // 4 * 4]
+    ca = _haar_ca1(u)
+    rows, cols = ca.shape
+    nb_r, nb_c = rows // _SVD_BLOCK, cols // _SVD_BLOCK
+    if nb_r * nb_c < wm_len:
+        return None
+
+    blocks = (ca[: nb_r * _SVD_BLOCK, : nb_c * _SVD_BLOCK]
+              .reshape(nb_r, _SVD_BLOCK, nb_c, _SVD_BLOCK)
+              .transpose(0, 2, 1, 3)
+              .reshape(-1, _SVD_BLOCK, _SVD_BLOCK))
+    # Batched 2-D DCT then batched SVD; we only need the largest singular value.
+    dct = _DCT4 @ blocks @ _DCT4.T
+    s0 = np.linalg.svd(dct, compute_uv=False)[:, 0]
+    votes = ((s0 % _SVD_SCALE) > 0.5 * _SVD_SCALE).astype(np.float64)
+
+    idx = np.arange(votes.size) % wm_len
+    sums = np.bincount(idx, weights=votes, minlength=wm_len)
+    counts = np.bincount(idx, minlength=wm_len).astype(np.float64)
+    means = np.divide(sums, counts, out=np.full(wm_len, 0.5), where=counts > 0)
+    return (means * 255 > 127).astype(np.uint8), means
+
+
+def detect_dwt_dct_svd(source) -> Optional[Finding]:
+    """Detect an `invisible-watermark` DWT-DCT-SVD mark.
+
+    The `dwtDctSvd` algorithm is the more robust of the library's two
+    classical modes and is what several Stable Diffusion forks select when
+    they want the mark to survive light editing.
+
+    Returns:
+        A Finding when a known generator signature matches by bit error rate;
+        None when the image reads as clean. A Finding with
+        ``status="unavailable"`` means numpy/Pillow were missing.
+    """
+    np = _require_numpy()
+    if np is None:
+        return _unavailable("dwt_dct_svd", "DWT-DCT-SVD (invisible-watermark)",
+                            "requires numpy: pip install \"slark[detect]\"")
+    loaded = _load_pixels(source)
+    if loaded is None:
+        return _unavailable("dwt_dct_svd", "DWT-DCT-SVD (invisible-watermark)",
+                            "requires numpy + Pillow: pip install \"slark[detect]\"")
+    arr, _w, _h = loaded
+
+    best: Optional[Tuple[str, float, bytes, int]] = None
+    for sig, name in KNOWN_DWT_SIGNATURES.items():
+        wm_len = len(sig) * 8
+        read = _svd_read_bits(arr, wm_len)
+        if read is None:
+            continue
+        bits, _means = read
+        ref = _sig_to_bits(sig)
+        ber = float(np.mean(bits != ref))
+        if best is None or ber < best[1]:
+            best = (name, ber, _bits_to_bytes_np(bits), wm_len)
+
+    if best is None:
+        return None
+    name, ber, payload, wm_len = best
+    if ber > _SVD_MAX_BER:
+        return None
+
+    printable = "".join(chr(b) if 32 <= b < 127 else "." for b in payload)
+    return Finding(
+        technique="dwt_dct_svd",
+        label="DWT-DCT-SVD frequency-domain watermark",
+        confidence=HIGH if ber <= 0.05 else MEDIUM,
+        detail=(f"recovered {payload!r} from singular-value quantization of "
+                f"DCT blocks (bit error {ber:.1%}; chance is ~50%) "
+                f"— matches {name}"),
+        attribution=name,
+        evidence={"payload_bytes": printable, "bit_error_rate": round(ber, 4),
+                  "signature_matched": name, "bits_read": wm_len,
+                  "algorithm": "invisible-watermark dwtDctSvd"},
+    )
+
+
 # --------------------------------------------------- generic LSB redundancy
 #
 # Many LSB stego/watermark tools (Slark's own image format included) write
@@ -888,50 +1021,145 @@ def detect_lsb_anomaly(source) -> Optional[Finding]:
 
 #: Byte signatures -> the tool they indicate. Matched case-insensitively
 #: against raw container bytes.
+# These lists were rebuilt from *observed* bytes, not from guesswork. Sources
+# checked: signed C2PA JPEGs from the c2pa-rs and c2pa-org/public-testfiles
+# corpora, the IPTC digitalsourcetype vocabulary (cv.iptc.org), and the
+# metadata-writing code of ComfyUI (`nodes.py` SaveImage) and AUTOMATIC1111
+# (`modules/images.py` save_image_with_geninfo). Two corrections came out of
+# that pass:
+#
+#   1. The single most authoritative AI marker was missing entirely. Real
+#      C2PA manifests declare generative origin with an IPTC URI, e.g.
+#      `digitalSourceType .../trainedAlgorithmicMedia`. A real signed fixture
+#      (c2pa-rs `C.jpg`) carries `algorithmicMedia`; my list had neither.
+#   2. Several guessed names were bare dictionary words matched anywhere in
+#      the file, which attributed innocent photos to AI. Measured: 6 of 6
+#      ordinary captions were falsely attributed — "imagen" (Spanish for
+#      "image") -> Google Imagen, "magnetic flux" -> FLUX, "grok" in a note
+#      -> xAI Grok. Those now live in AMBIGUOUS_SIGNATURES and only count
+#      when they appear in a metadata field that assigns provenance.
+#
+# Also confirmed by reading the writers: ComfyUI does NOT write the string
+# "comfyui" — it writes PNG text chunks named `prompt` and `workflow` holding
+# a node-graph JSON, so it is identified by chunk key + `class_type`.
+# AUTOMATIC1111 writes one `parameters` chunk of infotext, not its own name.
+
+#: Unambiguous markers: strings that do not occur in ordinary image metadata.
 GENERATOR_SIGNATURES: List[Tuple[bytes, str]] = [
+    # --- provenance containers (observed in real signed files) -------------
     (b"c2pa", "C2PA / Content Credentials"),
     (b"jumbf", "JUMBF (C2PA container)"),
     (b"contentcredentials", "Content Credentials"),
+    (b"content credentials", "Content Credentials"),
+    # --- IPTC digitalSourceType: the authoritative "this is AI" statement --
+    # Verified against cv.iptc.org/newscodes/digitalsourcetype.
+    (b"trainedalgorithmicmedia", "Generative AI (IPTC trainedAlgorithmicMedia)"),
+    (b"compositewithtrainedalgorithmicmedia",
+     "Generative AI edit (IPTC compositeWithTrainedAlgorithmicMedia)"),
+    (b"compositesynthetic", "Generative AI composite (IPTC compositeSynthetic)"),
+    (b"algorithmicmedia", "Algorithmic media (IPTC algorithmicMedia)"),
+    (b"digitalsourcetype", "IPTC digital source type declared"),
+    # --- named tools (distinctive enough to match anywhere) ----------------
     (b"midjourney", "Midjourney"),
     (b"dall-e", "OpenAI DALL-E"),
-    (b"dalle", "OpenAI DALL-E"),
+    (b"dall\xc2\xb7e", "OpenAI DALL-E"),
     (b"openai", "OpenAI"),
     (b"stable diffusion", "Stable Diffusion"),
     (b"stablediffusion", "Stable Diffusion"),
     (b"stable-diffusion", "Stable Diffusion"),
     (b"automatic1111", "AUTOMATIC1111 WebUI"),
+    (b"stable-diffusion-webui", "AUTOMATIC1111 WebUI"),
     (b"comfyui", "ComfyUI"),
     (b"invokeai", "InvokeAI"),
     (b"novelai", "NovelAI"),
-    (b"firefly", "Adobe Firefly"),
-    (b"adobe stock", "Adobe"),
+    (b"adobe firefly", "Adobe Firefly"),
     (b"synthid", "Google SynthID"),
-    (b"imagen", "Google Imagen"),
-    (b"gemini", "Google Gemini"),
     (b"ideogram", "Ideogram"),
-    (b"flux", "Black Forest Labs FLUX"),
     (b"leonardo.ai", "Leonardo.AI"),
     (b"playground ai", "Playground AI"),
-    (b"recraft", "Recraft"),
-    (b"grok", "xAI Grok"),
     (b"nano banana", "Google Nano Banana"),
     (b"seedream", "ByteDance Seedream"),
     (b"qwen-image", "Alibaba Qwen-Image"),
+    (b"black forest labs", "Black Forest Labs FLUX"),
+    (b"gpt-image", "OpenAI GPT Image"),
     (b"trainedmodel", "AI model metadata"),
 ]
 
+#: Words that DO name generators but are also ordinary vocabulary, so they
+#: only count inside a metadata field that actually assigns provenance
+#: (Software, CreatorTool, claim_generator, softwareAgent, ...). Matching
+#: these anywhere in the file caused 6/6 false positives on real captions.
+AMBIGUOUS_SIGNATURES: List[Tuple[bytes, str]] = [
+    (b"imagen", "Google Imagen"),            # Spanish/Portuguese for "image"
+    (b"flux", "Black Forest Labs FLUX"),     # magnetic/solar flux
+    (b"grok", "xAI Grok"),                   # the English verb
+    (b"firefly", "Adobe Firefly"),           # the insect
+    (b"gemini", "Google Gemini"),            # the constellation / star sign
+    (b"recraft", "Recraft"),
+    (b"dalle", "OpenAI DALL-E"),             # substring of many words
+    (b"midjourney", "Midjourney"),
+]
+
+#: Metadata fields whose value asserts what produced the file. Only these are
+#: searched for AMBIGUOUS_SIGNATURES. Names taken from observed real files:
+#: XMP `xmp:CreatorTool`, C2PA `claim_generator` / `softwareAgent`, EXIF
+#: `Software`, and the PNG chunk keys the diffusion UIs actually write.
+#: Deliberately excludes free-text caption fields (Description, Comment,
+#: Title, UserComment): a caption is what the image is *of*, not what made
+#: it, and including them reproduced all 6 measured false positives.
+PROVENANCE_FIELDS: Tuple[bytes, ...] = (
+    b"claim_generator", b"softwareagent", b"creatortool", b"software",
+    b"digitalsourcetype", b"generator", b"parameters", b"prompt", b"workflow",
+)
+
+#: Generic IPTC terms that are substrings of a more specific sibling; drop the
+#: vague one when the precise one also matched, so attribution stays sharp.
+_SIGNATURE_SHADOWS: Dict[str, Tuple[str, ...]] = {
+    "Algorithmic media (IPTC algorithmicMedia)": (
+        "Generative AI (IPTC trainedAlgorithmicMedia)",
+        "Generative AI edit (IPTC compositeWithTrainedAlgorithmicMedia)",
+    ),
+    "IPTC digital source type declared": (
+        "Generative AI (IPTC trainedAlgorithmicMedia)",
+        "Generative AI edit (IPTC compositeWithTrainedAlgorithmicMedia)",
+        "Generative AI composite (IPTC compositeSynthetic)",
+        "Algorithmic media (IPTC algorithmicMedia)",
+    ),
+}
+
 #: Generation-parameter keys that betray a diffusion pipeline even when the
-#: tool name is absent.
+#: tool name is absent. The A1111 keys were read off its own infotext writer
+#: (`modules/processing.py`), which emits "Steps: .., Sampler: .., CFG scale:
+#: .., Seed: .., Size: .., Model hash: ..".
 PARAM_HINTS: List[Tuple[bytes, str]] = [
     (b"sampler:", "diffusion sampler parameters"),
+    (b"sampler_name", "diffusion sampler parameters"),
     (b"steps:", "diffusion step count"),
     (b"cfg scale", "classifier-free guidance scale"),
+    (b"cfg_scale", "classifier-free guidance scale"),
     (b"denoising strength", "diffusion denoising parameter"),
     (b"negative prompt", "diffusion negative prompt"),
     (b"model hash", "diffusion model hash"),
     (b"seed:", "generation seed"),
     (b"lora:", "LoRA adapter reference"),
+    (b"class_type", "ComfyUI node graph"),
+    (b"ckpt_name", "diffusion checkpoint reference"),
+    (b"safetensors", "model weights reference"),
+    (b"clip skip", "CLIP skip parameter"),
+    (b"hires upscale", "high-res upscale parameter"),
 ]
+
+#: PNG text-chunk keys that identify the writing tool by themselves. Read
+#: from the tools' own source, since neither writes its product name.
+CHUNK_KEY_TOOLS: Dict[str, str] = {
+    "parameters": "AUTOMATIC1111-style WebUI (parameters chunk)",
+    "workflow": "ComfyUI (workflow chunk)",
+    "prompt": "ComfyUI (prompt chunk)",
+    "sd-metadata": "InvokeAI (sd-metadata chunk)",
+    "invokeai_metadata": "InvokeAI (invokeai_metadata chunk)",
+    "dream": "InvokeAI (legacy dream chunk)",
+    "aiframe": "AI generation metadata",
+}
 
 
 def _png_chunks(data: bytes) -> List[Tuple[str, bytes]]:
@@ -1020,6 +1248,34 @@ def detect_image_metadata(source) -> List[Finding]:
     tools = sorted({name for sig, name in GENERATOR_SIGNATURES if sig in lowered})
     params = sorted({name for sig, name in PARAM_HINTS if sig in lowered})
 
+    # Ambiguous names ("imagen", "flux", "grok") only count inside a field
+    # that actually asserts provenance — see AMBIGUOUS_SIGNATURES.
+    scopes: List[bytes] = []
+    for key, val in text_chunks.items():
+        if key.lower().encode("latin-1", "replace") in PROVENANCE_FIELDS:
+            scopes.append(val.lower().encode("utf-8", "replace"))
+    for field in PROVENANCE_FIELDS:
+        at = lowered.find(field)
+        while at != -1 and len(scopes) < 64:
+            # A provenance value follows its key; 160 bytes covers real ones.
+            scopes.append(lowered[at:at + 160])
+            at = lowered.find(field, at + 1)
+    if scopes:
+        blob = b"\n".join(scopes)
+        tools = sorted(set(tools) | {name for sig, name in AMBIGUOUS_SIGNATURES
+                                     if sig in blob})
+
+    # Tools that never write their own name are identified by chunk key.
+    tools = sorted(set(tools) | {CHUNK_KEY_TOOLS[k] for k in text_chunks
+                                 if k.lower() in CHUNK_KEY_TOOLS})
+
+    # Prefer the specific IPTC term over its generic substring.
+    tset = set(tools)
+    for vague, specific in _SIGNATURE_SHADOWS.items():
+        if vague in tset and tset.intersection(specific):
+            tset.discard(vague)
+    tools = sorted(tset)
+
     if tools:
         c2pa = [t for t in tools if "C2PA" in t or "Content Credentials" in t]
         findings.append(Finding(
@@ -1078,6 +1334,158 @@ def _detect_slark_image(source) -> List[Finding]:
     )]
 
 
+# ------------------------------------------------------------------ RivaGAN
+#
+# `invisible-watermark`'s third algorithm is RivaGAN: a learned 32-bit
+# watermark, shipped as `rivagan_decoder.onnx` inside the imwatermark
+# package. It needs no torch at runtime — the reference wrapper only uses
+# torch for tensor reshaping, which is plain numpy work — so given
+# onnxruntime and the model file we can run the real decoder.
+#
+# IMPORTANT, measured limitation. RivaGAN is a *keyed* scheme and cannot be
+# turned into a trustworthy blind detector:
+#
+#   * The obvious blind statistic (magnitude of the decoder logits) looked
+#     compelling at first — watermarked photos gave mean |logit| 9.4-13.5
+#     against 0.77-0.88 for clean photos. But feeding the network
+#     out-of-distribution input makes it hallucinate confidently: pure
+#     uniform noise scored 9.9-14.2 and synthetic high-frequency textures
+#     13.7-18.4, i.e. fully overlapping the watermarked range.
+#   * A spatial-roughness guard excludes the noise case, but not textures.
+#   * Bit *stability* under small perturbation also fails: clean textures
+#     decoded just as stably (0.98-1.00) as genuinely marked images
+#     (0.95-0.99), so robustness does not separate real from hallucinated.
+#
+# Therefore: with a candidate payload we report a real detection scored by
+# bit error rate; without one we report `status="unavailable"` rather than
+# guessing. Reporting a blind RivaGAN verdict would mean claiming an
+# accuracy we measured and could not achieve.
+
+_RIVA_BITS = 32
+_RIVA_THRESHOLD = 0.52     # the reference decoder's own bit threshold
+#: Chosen from the binomial null, not just the observed gap: at 8/32 bits the
+#: probability a random image matches a given 32-bit key is 3.5e-3, while
+#: recall on measured true positives is 87% (max observed TP error 0.344,
+#: min observed FP error 0.406 over 15 positives / 23 negatives incl.
+#: wrong-key marked images).
+_RIVA_MAX_BER = 0.25
+_RIVA_MODEL_NAME = "rivagan_decoder.onnx"
+
+
+def _riva_decoder() -> Optional[Any]:
+    """Load the RivaGAN ONNX decoder, or None if unavailable."""
+    try:
+        import onnxruntime
+    except ImportError:
+        return None
+    try:
+        import imwatermark
+        model = _os.path.join(_os.path.dirname(_os.path.abspath(
+            imwatermark.__file__)), _RIVA_MODEL_NAME)
+    except Exception:
+        return None
+    if not _os.path.exists(model):
+        return None
+    try:
+        opts = onnxruntime.SessionOptions()
+        opts.log_severity_level = 3
+        return onnxruntime.InferenceSession(
+            model, opts, providers=["CPUExecutionProvider"])
+    except Exception:
+        return None
+
+
+def _riva_read_bits(arr, session) -> Optional[Any]:
+    """Run the RivaGAN decoder on an RGB array; returns 32 bits."""
+    np = _require_numpy()
+    h, w = arr.shape[:2]
+    if min(h, w) < 64:
+        return None
+    rgb = arr[:, :, :3]
+    # Mirror the reference: [frame]/127.5-1, then permute(3,0,1,2).unsqueeze(0)
+    frame = np.array([rgb], dtype=np.float32) / 127.5 - 1.0
+    frame = np.transpose(frame, (3, 0, 1, 2))[None, ...]
+    logits = session.run(None, {"frame": frame})[0][0]
+    return (logits > _RIVA_THRESHOLD).astype(np.uint8), logits
+
+
+def detect_rivagan(source, *, expect: Optional[Any] = None) -> Optional[Finding]:
+    """Detect an `invisible-watermark` RivaGAN (learned, 32-bit) mark.
+
+    RivaGAN is keyed, so honest detection needs a candidate payload. Pass one
+    via ``expect`` (32 bits, or bytes whose bits are used) to get a real
+    verdict scored by bit error rate.
+
+    Args:
+        source: path, file-like object, raw bytes, or ``PIL.Image.Image``.
+        expect: the 32-bit payload to test for. Without it this returns an
+            ``status="unavailable"`` Finding, because blind RivaGAN detection
+            is not reliable (see the module notes for the measurements).
+
+    Returns:
+        A Finding, or None when a candidate payload was supplied and did not
+        match.
+    """
+    label = "RivaGAN learned watermark"
+    np = _require_numpy()
+    if np is None:
+        return _unavailable("rivagan", label,
+                            "requires numpy: pip install \"slark[detect]\"")
+
+    if expect is None:
+        return _unavailable(
+            "rivagan", label,
+            "RivaGAN is keyed; blind detection is unreliable (clean "
+            "high-frequency textures produce decoder output indistinguishable "
+            "from a real mark) — pass expect=<32 bits> to test a candidate")
+
+    session = _riva_decoder()
+    if session is None:
+        return _unavailable(
+            "rivagan", label,
+            "needs onnxruntime and the imwatermark model: "
+            "pip install onnxruntime invisible-watermark")
+
+    loaded = _load_pixels(source)
+    if loaded is None:
+        return _unavailable("rivagan", label,
+                            "requires numpy + Pillow: pip install \"slark[detect]\"")
+    arr, _w, _h = loaded
+
+    if isinstance(expect, (bytes, bytearray)):
+        ref = _sig_to_bits(bytes(expect))
+    else:
+        ref = np.asarray(expect, dtype=np.uint8).ravel()
+    if ref.size != _RIVA_BITS:
+        return _unavailable("rivagan", label,
+                            f"expect must be {_RIVA_BITS} bits, got {ref.size}")
+
+    try:
+        read = _riva_read_bits(arr, session)
+    except Exception as exc:
+        return _unavailable("rivagan", label,
+                            f"decoder failed: {type(exc).__name__}: {exc}")
+    if read is None:
+        return _unavailable("rivagan", label, "image too small (needs >=64px)")
+    bits, logits = read
+
+    ber = float(np.mean(bits != ref))
+    if ber > _RIVA_MAX_BER:
+        return None
+    return Finding(
+        technique="rivagan",
+        label=label,
+        confidence=HIGH if ber <= 0.10 else MEDIUM,
+        detail=(f"RivaGAN decoder recovered the supplied 32-bit payload with "
+                f"{ber:.1%} bit error (chance is ~50%; a random image matches "
+                f"a given key at this threshold with probability ~3.5e-3)"),
+        attribution="invisible-watermark RivaGAN",
+        evidence={"bit_error_rate": round(ber, 4), "bits_read": _RIVA_BITS,
+                  "mean_abs_logit": round(float(np.abs(logits).mean()), 3),
+                  "algorithm": "invisible-watermark rivaGan"},
+    )
+
+
 def _synthid_note() -> Finding:
     return Finding(
         technique="learned_pixel_watermark",
@@ -1095,15 +1503,15 @@ def scan_image(source, *, include_notes: bool = True) -> Report:
     """Scan an image for watermarks and hidden payloads from any tool.
 
     Runs, in order: Slark's own SLK1 tag, container/C2PA metadata, the
-    Stable Diffusion DWT-DCT reader, redundant-LSB structure, and LSB-plane
-    anomaly analysis.
+    Stable Diffusion DWT-DCT and DWT-DCT-SVD readers, redundant-LSB
+    structure, and LSB-plane anomaly analysis.
 
     Args:
         source: path, file-like object, raw bytes, or ``PIL.Image.Image``.
             A path or bytes gives the best results — a bare PIL image has
             already discarded most container metadata.
-        include_notes: also report undetectable classes (neural watermarks)
-            so a "clean" result is never overstated.
+        include_notes: also report undetectable classes (neural watermarks,
+            keyed RivaGAN) so a "clean" result is never overstated.
 
     Returns:
         A :class:`Report`.
@@ -1113,7 +1521,8 @@ def scan_image(source, *, include_notes: bool = True) -> Report:
     findings += detect_image_metadata(source)
 
     # Pixel-domain detectors need decoded pixels; a PIL image works directly.
-    for fn in (detect_dwt_dct, detect_lsb_redundancy, detect_lsb_anomaly):
+    for fn in (detect_dwt_dct, detect_dwt_dct_svd,
+               detect_lsb_redundancy, detect_lsb_anomaly):
         try:
             f = fn(source)
         except Exception as exc:  # a broken detector must not hide the others
@@ -1129,6 +1538,11 @@ def scan_image(source, *, include_notes: bool = True) -> Report:
 
     if include_notes:
         findings.append(_synthid_note())
+        # RivaGAN is keyed: without a candidate payload it is untestable, and
+        # saying nothing would let a keyed mark pass as "clean".
+        riva = detect_rivagan(source)
+        if riva is not None:
+            findings.append(riva)
     return Report(target="image", findings=findings)
 
 

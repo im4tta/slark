@@ -193,10 +193,12 @@ Exit codes: `0` something detected, `1` clean, `3` suspicious only,
 | Technique | What it finds |
 |---|---|
 | `dwt_dct` | the DWT-DCT mark `invisible-watermark` embeds — **Stable Diffusion's default** |
+| `dwt_dct_svd` | the same library's `dwtDctSvd` mode — markedly **more robust**, used by several SD forks |
+| `rivagan` | `invisible-watermark`'s learned 32-bit mode — scored **only with an expected payload** (keyed; see below) |
 | `slark_slk1` | Slark's own SLK1 pixel tag |
 | `lsb_redundancy` | repeated frames in the LSB plane (any redundant LSB tool) |
 | `lsb_anomaly` | an LSB plane too uniform to be natural |
-| `container_metadata` | C2PA / XMP / EXIF / PNG text naming ~25 generators |
+| `container_metadata` | C2PA / XMP / EXIF / PNG text: ~30 generators, IPTC `digitalSourceType`, and tools that never write their own name |
 | `generation_parameters` | diffusion params (`Steps:`, `Sampler:`, `CFG scale`…) |
 
 ### Two design decisions worth knowing
@@ -215,36 +217,103 @@ result can be audited rather than trusted blindly.
 - **Neural pixel watermarks** (SynthID-Image) need the vendor's private
   detector model. Metadata *naming* SynthID is found; the pixel mark is not
   verified.
+- **RivaGAN** is keyed. Given the expected 32 bits we score it for real; with
+  no key we report `unavailable`. Blind RivaGAN detection was implemented,
+  measured, and **rejected** — see below.
 
 Pass `include_notes=False` (or `--no-notes`) to suppress those and get a
 plain `clean` verdict.
 
 ### Accuracy, measured
 
-The DWT-DCT reader is reimplemented in pure numpy and validated **bit-exact
-against the reference `invisible-watermark` library**: it recovers the exact
-payload `b"StableDiffusionV1"` from reference-encoded images. Both directions
-are cross-checked in the test suite when that library is installed.
+Every threshold below was picked from a *measured* separation between true and
+false positives, never guessed. All three `invisible-watermark` algorithms are
+reimplemented in pure numpy and cross-checked against the reference library's
+own decoder on library-generated fixtures.
+
+**`dwt_dct`** (Stable Diffusion's default) — recovers the exact payload
+`b"StableDiffusionV1"` from reference-encoded images:
 
 | Input | Bit error | Result |
 |---|---|---|
 | reference-encoded watermark | ~0.08–0.11 | detected |
 | clean image | ~0.43–0.50 (chance) | not detected |
 
-On a synthetic set of photo / noise / flat / gradient images: **20/20 true
-positives, 0/20 false positives.**
+**`dwt_dct_svd`** — our reader agrees with the reference decoder on
+**100.00% of bits**, giving *zero* bit error on payload recovery. The
+separation is total, so the 0.20 threshold sits inside a wide empty gap:
 
-Robustness of the DWT-DCT mark (inherited from the algorithm, not the
-detector — the reference decoder fails on exactly the same inputs):
+| Population | n | Bit error | Result |
+|---|---|---|---|
+| watermarked (reference-encoded) | 24 | **0.0000** (all) | detected |
+| photos, noise, flat fills, gradients, `dwtDct`-marked | 21 | ≥ 0.3125 | not detected |
 
-| Transformation | Survives |
-|---|---|
-| brightness shift, 3×3 blur, mild Gaussian noise | ✅ |
-| JPEG (any quality), resize, crop | ❌ |
+On identical images `dwt_dct` manages only ~0.30 bit error where `dwtDctSvd`
+reaches 0.000 — the SVD mode really is the more robust of the two, which is
+why forks that want the mark to survive editing choose it.
+
+**`rivagan`** — keyed mode only, scored against an expected 32-bit payload:
+
+| Population | n | Bit error |
+|---|---|---|
+| true positives | 15 | ≤ 0.344 |
+| negatives incl. **wrong-key** marked images | 23 | ≥ 0.406 |
+
+The 0.25 threshold comes from the binomial null rather than that gap: at
+8/32 bits the chance a random image matches a given key is 3.5e-03, for 87%
+recall on measured true positives. JPEG q95→q70 costs 0.062–0.156 bit error.
+
+**Why RivaGAN has no blind mode.** Three blind statistics were implemented and
+measured, and all three failed:
+
+| Attempted statistic | Marked | Unmarked | Verdict |
+|---|---|---|---|
+| decoder logit magnitude | 9.4–13.5 | photos 0.77–1.13, but **noise 9.9–14.2, textures 13.7–18.4** | overlaps |
+| + spatial-roughness guard | — | excludes noise, **not textures** | insufficient |
+| bit stability under ±2 / JPEG q92 | 0.953–0.992 | clean textures **0.984–1.000** | overlaps |
+
+The network reports high confidence on out-of-distribution input it has never
+watermarked. Shipping a blind verdict would mean claiming accuracy we measured
+and could not achieve — so blind mode returns `unavailable`.
+
+**Metadata signatures, validated against real files.** The signature list was
+rebuilt from observed bytes: real signed C2PA JPEGs (the `c2pa-rs` and
+`c2pa-org/public-testfiles` corpora), the IPTC `digitalsourcetype` vocabulary,
+and the metadata-writing source of ComfyUI and AUTOMATIC1111. That pass found
+two real bugs in the previous guessed list:
+
+1. **The most authoritative AI marker was missing entirely.** Real manifests
+   declare generative origin with an IPTC URI (`trainedAlgorithmicMedia`,
+   `algorithmicMedia`, …). ComfyUI and IPTC fixtures both returned
+   `inconclusive`. Also confirmed by reading their writers: ComfyUI never
+   writes the string "comfyui" (it writes `prompt`/`workflow` chunks) and
+   AUTOMATIC1111 never writes its own name (just a `parameters` chunk) — so
+   both are now identified by chunk key.
+2. **6 of 6 innocent captions were falsely attributed to AI**, because bare
+   dictionary words matched anywhere in the file: *"una **imagen** de mi
+   perro"* → Google Imagen, *"magnetic **flux**"* → FLUX, *"I finally
+   **grok** this lens"* → xAI Grok, *"a **firefly** at dusk"* → Adobe Firefly,
+   *"the **Gemini** constellation"* → Google Gemini.
+
+Ambiguous names now only count inside a field that actually *asserts*
+provenance (`Software`, `CreatorTool`, `claim_generator`, `softwareAgent`, …)
+and never inside free-text captions. Result after the fix: **11/11 true
+positives, 0/10 false positives**, with all five real C2PA files attributed
+correctly (and `cloud.jpg`, which carries no such claim, correctly
+`inconclusive`).
+
+Robustness of these marks (inherited from the algorithms, not the detectors —
+the reference decoders fail on exactly the same inputs):
+
+| Transformation | `dwt_dct` | `dwt_dct_svd` | `rivagan` |
+|---|---|---|---|
+| brightness shift, 3×3 blur, mild noise | ✅ | ✅ | ✅ |
+| JPEG q70–q95 | ❌ | ❌ | ✅ (0.06–0.16 BER) |
+| resize, crop | ❌ | ❌ | ❌ |
 
 So a *negative* image result means "no detectable mark in these pixels" —
-not "this wasn't AI-generated". Lossy re-encoding erases these marks by
-design.
+not "this wasn't AI-generated". Lossy re-encoding erases most of these marks
+by design.
 
 ### Honest limits
 
@@ -340,6 +409,23 @@ MIT — see [LICENSE](LICENSE).
 - **Playground**: two new "Detect others" tabs, running the same detectors
   in-browser with verified Python↔JS parity.
 - 62 new tests (146 total).
+- **`dwtDctSvd` reader** (`detect_dwt_dct_svd`) — the library's more robust
+  classical mode, reimplemented in numpy at **100.00% bit agreement** with
+  the reference decoder (0.000 BER payload recovery; negatives ≥ 0.3125).
+- **`rivagan` reader** (`detect_rivagan`) — runs the vendor ONNX decoder
+  without torch. Keyed scoring is real (threshold from the binomial null,
+  P=3.5e-03); **blind detection was implemented, measured and rejected**
+  because the decoder is equally confident on unmarked noise and textures,
+  so it reports `unavailable` instead of guessing.
+- **Metadata signatures rebuilt from real files** — added IPTC
+  `digitalSourceType`, and chunk-key identification for ComfyUI and
+  AUTOMATIC1111 (neither writes its own name). Fixed **6/6 false positives**
+  on ordinary captions by scoping ambiguous names ("imagen", "flux", "grok",
+  "firefly", "gemini") to provenance-asserting fields only. Now 11/11 true
+  positives, 0/10 false positives.
+- Optional `slark[rivagan]` extra for `onnxruntime`.
+- 33 further tests (179 total), and Python↔JS parity re-verified bit-for-bit
+  on library-generated fixtures.
 
 ### 0.3.0
 - **Signed marks** — `encode(..., key=...)` adds a truncated HMAC-SHA256

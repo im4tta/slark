@@ -39,6 +39,9 @@ slark = "slark.cli:main"
 [project.optional-dependencies]
 image = ["pillow>=9.0"]
 detect = ["pillow>=9.0", "numpy>=1.20"]
+# RivaGAN scoring runs the vendor ONNX decoder shipped inside
+# invisible-watermark. Optional: every other detector works without it.
+rivagan = ["pillow>=9.0", "numpy>=1.20", "onnxruntime>=1.16", "invisible-watermark>=0.2.0"]
 all = ["pillow>=9.0", "numpy>=1.20"]
 dev = ["pytest>=7.0", "pillow>=9.0", "numpy>=1.20"]
 

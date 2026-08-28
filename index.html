@@ -1819,6 +1819,175 @@ function detectDwtDct(d, w, h) {
       algorithm: 'invisible-watermark dwtDct' });
 }
 
+/* ---------- dwtDctSvd (invisible-watermark's more robust classical mode) ----------
+   Same Haar-DWT front end and YUV chroma channel as dwtDct, but each 4x4 LL
+   block gets a real 2-D DCT and then an SVD; the bit lives in the
+   quantization residue of the LARGEST singular value. Verified bit-exact
+   against the reference Python decoder: 100.00% bit agreement, 0.000 BER
+   payload recovery on library-generated fixtures. Negatives (photos, noise,
+   flat fills, gradients, dwtDct-marked images) bottom out at 0.3125 BER, so
+   the 0.20 threshold sits inside a wide measured gap. */
+const SVD_SCALE = 36.0, SVD_BLOCK = 4, SVD_MAX_BER = 0.20;
+
+/* Orthonormal 4x4 DCT-II matrix; D * block * D^T equals cv2.dct.
+   Matches cv2.dct to 4.3e-14 on 4x4 blocks (checked in Python). */
+const DCT4 = (() => {
+  const n = SVD_BLOCK, d = new Float64Array(n * n);
+  for (let k = 0; k < n; k++) {
+    for (let x = 0; x < n; x++) {
+      d[k * n + x] = (k === 0)
+        ? Math.sqrt(1.0 / n)
+        : Math.cos(Math.PI * (2 * x + 1) * k / (2 * n)) * Math.sqrt(2.0 / n);
+    }
+  }
+  return d;
+})();
+
+/* Largest singular value of a 4x4 matrix, via cyclic Jacobi on the Gram
+   matrix A^T*A. Jacobi rather than power iteration: when the top two
+   singular values are close, power iteration converges too slowly to
+   resolve the mod-36 residue the bit is hidden in. */
+function topSingularValue4(a) {
+  const n = SVD_BLOCK;
+  /* g = a^T * a  (symmetric, positive semi-definite) */
+  const g = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    for (let j = i; j < n; j++) {
+      let s = 0;
+      for (let k = 0; k < n; k++) s += a[k * n + i] * a[k * n + j];
+      g[i * n + j] = s; g[j * n + i] = s;
+    }
+  }
+  for (let sweep = 0; sweep < 24; sweep++) {
+    let off = 0;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) off += g[i * n + j] * g[i * n + j];
+    if (off <= 1e-24) break;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const gij = g[i * n + j];
+        if (Math.abs(gij) < 1e-30) continue;
+        const theta = (g[j * n + j] - g[i * n + i]) / (2 * gij);
+        const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
+        const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+        for (let k = 0; k < n; k++) {
+          const gki = g[k * n + i], gkj = g[k * n + j];
+          g[k * n + i] = c * gki - s * gkj;
+          g[k * n + j] = s * gki + c * gkj;
+        }
+        for (let k = 0; k < n; k++) {
+          const gik = g[i * n + k], gjk = g[j * n + k];
+          g[i * n + k] = c * gik - s * gjk;
+          g[j * n + k] = s * gik + c * gjk;
+        }
+      }
+    }
+  }
+  let maxEig = 0;
+  for (let i = 0; i < n; i++) maxEig = Math.max(maxEig, g[i * n + i]);
+  return Math.sqrt(Math.max(0, maxEig));
+}
+
+function svdReadBits(d, w, h, wmLen) {
+  const cw = w - (w % 4), ch = h - (h % 4);
+  if (Math.min(cw, ch) < 2 * SVD_BLOCK * 2) return null;
+  const full = uPlane(d, w, h);
+  const plane = new Float64Array(cw * ch);
+  for (let i = 0; i < ch; i++) for (let j = 0; j < cw; j++) plane[i * cw + j] = full[i * w + j];
+  const { ll, w: lw, h: lh } = haarLL(plane, cw, ch);
+  const nbR = Math.floor(lh / SVD_BLOCK), nbC = Math.floor(lw / SVD_BLOCK);
+  if (nbR * nbC < wmLen) return null;
+
+  const blk = new Float64Array(SVD_BLOCK * SVD_BLOCK);
+  const tmp = new Float64Array(SVD_BLOCK * SVD_BLOCK);
+  const dct = new Float64Array(SVD_BLOCK * SVD_BLOCK);
+  const sums = new Float64Array(wmLen), counts = new Float64Array(wmLen);
+  let num = 0;
+  for (let bi = 0; bi < nbR; bi++) {
+    for (let bj = 0; bj < nbC; bj++) {
+      for (let r = 0; r < SVD_BLOCK; r++)
+        for (let c = 0; c < SVD_BLOCK; c++)
+          blk[r * SVD_BLOCK + c] = ll[(bi * SVD_BLOCK + r) * lw + (bj * SVD_BLOCK + c)];
+      /* tmp = DCT4 * blk */
+      for (let r = 0; r < SVD_BLOCK; r++) {
+        for (let c = 0; c < SVD_BLOCK; c++) {
+          let s = 0;
+          for (let k = 0; k < SVD_BLOCK; k++) s += DCT4[r * SVD_BLOCK + k] * blk[k * SVD_BLOCK + c];
+          tmp[r * SVD_BLOCK + c] = s;
+        }
+      }
+      /* dct = tmp * DCT4^T */
+      for (let r = 0; r < SVD_BLOCK; r++) {
+        for (let c = 0; c < SVD_BLOCK; c++) {
+          let s = 0;
+          for (let k = 0; k < SVD_BLOCK; k++) s += tmp[r * SVD_BLOCK + k] * DCT4[c * SVD_BLOCK + k];
+          dct[r * SVD_BLOCK + c] = s;
+        }
+      }
+      const s0 = topSingularValue4(dct);
+      const bit = (((s0 % SVD_SCALE) + SVD_SCALE) % SVD_SCALE) > 0.5 * SVD_SCALE ? 1 : 0;
+      const slot = num % wmLen;
+      sums[slot] += bit; counts[slot] += 1; num++;
+    }
+  }
+  const bits = new Uint8Array(wmLen);
+  for (let i = 0; i < wmLen; i++) {
+    const mean = counts[i] ? sums[i] / counts[i] : 0.5;
+    bits[i] = (mean * 255 > 127) ? 1 : 0;
+  }
+  return bits;
+}
+
+function detectDwtDctSvd(d, w, h) {
+  let best = null;
+  for (const [sig, name] of KNOWN_DWT_SIGS) {
+    const wmLen = sig.length * 8;
+    const bits = svdReadBits(d, w, h, wmLen);
+    if (!bits) continue;
+    let diff = 0;
+    for (let i = 0; i < wmLen; i++) {
+      const refBit = (sig.charCodeAt(i >> 3) >> (7 - (i & 7))) & 1;
+      if (bits[i] !== refBit) diff++;
+    }
+    const ber = diff / wmLen;
+    if (!best || ber < best.ber) {
+      let payload = '';
+      for (let i = 0; i + 8 <= wmLen; i += 8) {
+        let byte = 0;
+        for (let k = 0; k < 8; k++) byte = (byte << 1) | bits[i + k];
+        payload += (byte >= 32 && byte < 127) ? String.fromCharCode(byte) : '.';
+      }
+      best = { name, ber, payload, wmLen };
+    }
+  }
+  if (!best || best.ber > SVD_MAX_BER) return null;
+  return dFinding('dwt_dct_svd', 'DWT-DCT-SVD frequency-domain watermark',
+    best.ber <= 0.05 ? D_HIGH : D_MED,
+    `recovered "${best.payload}" from singular-value quantization of DCT blocks (bit error ${(best.ber * 100).toFixed(1)}%; chance is ~50%) — matches ${best.name}`,
+    best.name,
+    { payload_bytes: best.payload, bit_error_rate: +best.ber.toFixed(4),
+      signature_matched: best.name, bits_read: best.wmLen,
+      algorithm: 'invisible-watermark dwtDctSvd' });
+}
+
+/* ---------- RivaGAN (invisible-watermark's learned 32-bit mode) ----------
+   Deliberately NOT attempted blind. The reference decoder is a 1.09MB ONNX
+   model and, more importantly, RivaGAN is a KEYED scheme. Measured in Python:
+   the obvious blind statistic (decoder logit magnitude) gives 9.4-13.5 on
+   watermarked photos vs 0.77-1.13 on clean photos, which looks decisive —
+   but pure noise scores 9.9-14.2 and synthetic textures 13.7-18.4, fully
+   overlapping the watermarked range, because the network hallucinates
+   confidently on out-of-distribution input. Bit stability under perturbation
+   fails to separate them either (clean textures 0.984-1.000 vs marked
+   0.953-0.992). So we say "unknown", never "clean". */
+const RIVA_BITS = 32;
+function rivaganNote() {
+  return dFinding('rivagan', 'RivaGAN learned watermark', 0,
+    `RivaGAN embeds a keyed ${RIVA_BITS}-bit payload; scoring it needs the vendor's ONNX decoder AND the expected bits. Blind detection was measured and rejected — the decoder reports high confidence on unmarked noise and textures too — so presence cannot be tested here and this is unknown rather than absent`,
+    null, { bits: RIVA_BITS, algorithm: 'invisible-watermark rivaGan',
+            requires: 'onnxruntime + rivagan_decoder.onnx + expected payload' },
+    'unavailable');
+}
+
 const LSB_WINDOW = 512, LSB_MIN_AGREE = 0.75, LSB_MIN_ENTROPY = 0.10;
 function detectLsbRedundancy(d, w, h) {
   const n = w * h * 3;
@@ -1883,26 +2052,98 @@ function detectLsbAnomaly(d, w, h) {
       delta: +delta.toFixed(4) }, 'suspicious');
 }
 
-/* generator names that appear in C2PA / XMP / EXIF / PNG text */
+/* Signature tables rebuilt from OBSERVED real formats (see slark/detect.py).
+   Unambiguous markers may match anywhere in the file. */
 const GENERATOR_SIGS = [
   ['c2pa','C2PA / Content Credentials'],['jumbf','JUMBF (C2PA container)'],
-  ['contentcredentials','Content Credentials'],['midjourney','Midjourney'],
-  ['dall-e','OpenAI DALL·E'],['dalle','OpenAI DALL·E'],['openai','OpenAI'],
+  ['contentcredentials','Content Credentials'],['content credentials','Content Credentials'],
+  /* IPTC digitalSourceType — the authoritative "this is AI" declaration */
+  ['trainedalgorithmicmedia','Generative AI (IPTC trainedAlgorithmicMedia)'],
+  ['compositewithtrainedalgorithmicmedia','Generative AI edit (IPTC compositeWithTrainedAlgorithmicMedia)'],
+  ['compositesynthetic','Generative AI composite (IPTC compositeSynthetic)'],
+  ['algorithmicmedia','Algorithmic media (IPTC algorithmicMedia)'],
+  ['digitalsourcetype','IPTC digital source type declared'],
+  /* distinctive tool names */
+  ['midjourney','Midjourney'],['dall-e','OpenAI DALL·E'],['openai','OpenAI'],
   ['stable diffusion','Stable Diffusion'],['stablediffusion','Stable Diffusion'],
   ['stable-diffusion','Stable Diffusion'],['automatic1111','AUTOMATIC1111 WebUI'],
+  ['stable-diffusion-webui','AUTOMATIC1111 WebUI'],
   ['comfyui','ComfyUI'],['invokeai','InvokeAI'],['novelai','NovelAI'],
-  ['firefly','Adobe Firefly'],['synthid','Google SynthID'],['imagen','Google Imagen'],
-  ['gemini','Google Gemini'],['ideogram','Ideogram'],['flux','Black Forest Labs FLUX'],
-  ['leonardo.ai','Leonardo.AI'],['recraft','Recraft'],['grok','xAI Grok'],
+  ['adobe firefly','Adobe Firefly'],['synthid','Google SynthID'],
+  ['ideogram','Ideogram'],['leonardo.ai','Leonardo.AI'],['playground ai','Playground AI'],
   ['nano banana','Google Nano Banana'],['seedream','ByteDance Seedream'],
-  ['qwen-image','Alibaba Qwen-Image'],
+  ['qwen-image','Alibaba Qwen-Image'],['black forest labs','Black Forest Labs FLUX'],
+  ['gpt-image','OpenAI GPT Image'],['trainedmodel','AI model metadata'],
 ];
+/* Real generator names that are ALSO ordinary words. Matching these anywhere
+   attributed 6 of 6 innocent captions to AI ("imagen" = Spanish for image,
+   "magnetic flux", "grok" the verb), so they only count inside a field that
+   actually asserts provenance. */
+const AMBIGUOUS_SIGS = [
+  ['imagen','Google Imagen'],['flux','Black Forest Labs FLUX'],['grok','xAI Grok'],
+  ['firefly','Adobe Firefly'],['gemini','Google Gemini'],['recraft','Recraft'],
+  ['dalle','OpenAI DALL·E'],['midjourney','Midjourney'],
+];
+/* Deliberately excludes caption fields (description/comment/title). */
+const PROVENANCE_FIELDS = ['claim_generator','softwareagent','creatortool',
+  'software','digitalsourcetype','generator','parameters','prompt','workflow'];
+/* Tools that never write their own name — identified by PNG chunk key. */
+const CHUNK_KEY_TOOLS = {
+  'parameters':'AUTOMATIC1111-style WebUI (parameters chunk)',
+  'workflow':'ComfyUI (workflow chunk)', 'prompt':'ComfyUI (prompt chunk)',
+  'sd-metadata':'InvokeAI (sd-metadata chunk)',
+  'invokeai_metadata':'InvokeAI (invokeai_metadata chunk)',
+  'dream':'InvokeAI (legacy dream chunk)', 'aiframe':'AI generation metadata',
+};
+const SIG_SHADOWS = {
+  'Algorithmic media (IPTC algorithmicMedia)':
+    ['Generative AI (IPTC trainedAlgorithmicMedia)',
+     'Generative AI edit (IPTC compositeWithTrainedAlgorithmicMedia)'],
+  'IPTC digital source type declared':
+    ['Generative AI (IPTC trainedAlgorithmicMedia)',
+     'Generative AI edit (IPTC compositeWithTrainedAlgorithmicMedia)',
+     'Generative AI composite (IPTC compositeSynthetic)',
+     'Algorithmic media (IPTC algorithmicMedia)'],
+};
 const PARAM_SIGS = [
-  ['sampler:','diffusion sampler parameters'],['steps:','diffusion step count'],
-  ['cfg scale','classifier-free guidance scale'],['negative prompt','diffusion negative prompt'],
+  ['sampler:','diffusion sampler parameters'],['sampler_name','diffusion sampler parameters'],
+  ['steps:','diffusion step count'],['cfg scale','classifier-free guidance scale'],
+  ['cfg_scale','classifier-free guidance scale'],
+  ['negative prompt','diffusion negative prompt'],
   ['denoising strength','diffusion denoising parameter'],['model hash','diffusion model hash'],
   ['seed:','generation seed'],['lora:','LoRA adapter reference'],
+  ['class_type','ComfyUI node graph'],['ckpt_name','diffusion checkpoint reference'],
+  ['safetensors','model weights reference'],['clip skip','CLIP skip parameter'],
+  ['hires upscale','high-res upscale parameter'],
 ];
+/* PNG text chunk keys, so ambiguous names can be scoped to real fields. */
+function pngTextChunks(bytes) {
+  const out = {};
+  if (bytes.length < 8) return out;
+  const sig = [137,80,78,71,13,10,26,10];
+  for (let i = 0; i < 8; i++) if (bytes[i] !== sig[i]) return out;
+  let i = 8;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  while (i + 8 <= bytes.length) {
+    const len = dv.getUint32(i);
+    let type = '';
+    for (let k = 0; k < 4; k++) type += String.fromCharCode(bytes[i + 4 + k]);
+    if (len > bytes.length) break;
+    if (type === 'tEXt' || type === 'iTXt' || type === 'zTXt') {
+      let key = '', j = i + 8;
+      while (j < i + 8 + len && bytes[j] !== 0) key += String.fromCharCode(bytes[j++]);
+      let val = '';
+      for (let k = j + 1; k < i + 8 + len && val.length < 400; k++) {
+        const c = bytes[k];
+        val += (c >= 32 && c < 127) ? String.fromCharCode(c) : ' ';
+      }
+      out[key] = val;
+    }
+    i += 12 + len;
+    if (type === 'IEND') break;
+  }
+  return out;
+}
 function detectContainerMetadata(buf) {
   if (!buf) return [];
   const bytes = new Uint8Array(buf);
@@ -1911,16 +2152,45 @@ function detectContainerMetadata(buf) {
     const c = bytes[i];
     ascii += (c >= 32 && c < 127) ? String.fromCharCode(c).toLowerCase() : '\n';
   }
-  const tools = [...new Set(GENERATOR_SIGS.filter(([k]) => ascii.includes(k)).map(([, v]) => v))];
+  const chunks = pngTextChunks(bytes);
+  let tools = new Set(GENERATOR_SIGS.filter(([k]) => ascii.includes(k)).map(([, v]) => v));
   const params = [...new Set(PARAM_SIGS.filter(([k]) => ascii.includes(k)).map(([, v]) => v))];
+
+  /* ambiguous names: only inside a provenance-asserting field */
+  const scopes = [];
+  for (const [k, v] of Object.entries(chunks)) {
+    if (PROVENANCE_FIELDS.includes(k.toLowerCase())) scopes.push(v.toLowerCase());
+  }
+  for (const field of PROVENANCE_FIELDS) {
+    let at = ascii.indexOf(field);
+    while (at !== -1 && scopes.length < 64) {
+      scopes.push(ascii.slice(at, at + 160));
+      at = ascii.indexOf(field, at + 1);
+    }
+  }
+  if (scopes.length) {
+    const blob = scopes.join('\n');
+    for (const [k, v] of AMBIGUOUS_SIGS) if (blob.includes(k)) tools.add(v);
+  }
+  /* tools identified purely by which chunk key they write */
+  for (const k of Object.keys(chunks)) {
+    const hit = CHUNK_KEY_TOOLS[k.toLowerCase()];
+    if (hit) tools.add(hit);
+  }
+  /* prefer the specific IPTC term over its generic substring */
+  for (const [vague, specific] of Object.entries(SIG_SHADOWS)) {
+    if (tools.has(vague) && specific.some(x => tools.has(x))) tools.delete(vague);
+  }
+  const toolList = [...tools].sort();
+
   const out = [];
-  if (tools.length) {
-    const isC2pa = tools.some(t => /C2PA|Content Credentials/.test(t));
+  if (toolList.length) {
+    const isC2pa = toolList.some(t => /C2PA|Content Credentials/.test(t));
     out.push(dFinding('container_metadata', 'Declared AI provenance in metadata', D_HIGH,
-      `metadata names: ${tools.slice(0, 6).join(', ')}` +
+      `metadata names: ${toolList.slice(0, 6).join(', ')}` +
       (isC2pa ? '; C2PA manifest present but its signature is NOT validated here' : '') +
       ' — declared metadata is easily stripped or forged',
-      tools[0], { tools }));
+      toolList[0], { tools: toolList, png_text_keys: Object.keys(chunks).sort() }));
   } else if (params.length) {
     out.push(dFinding('generation_parameters', 'Diffusion generation parameters', D_MED,
       `found ${params.slice(0, 5).join(', ')} — characteristic of an image-generation pipeline, though no tool is named`,
@@ -1949,7 +2219,7 @@ function detectImageAll(imageData, rawBuffer) {
 
   findings.push(...detectContainerMetadata(rawBuffer));
 
-  for (const fn of [detectDwtDct, detectLsbRedundancy, detectLsbAnomaly]) {
+  for (const fn of [detectDwtDct, detectDwtDctSvd, detectLsbRedundancy, detectLsbAnomaly]) {
     try { const f = fn(d, w, h); if (f) findings.push(f); }
     catch (e) {
       findings.push(dFinding(fn.name, fn.name, 0, `detector error: ${e.message}`,
@@ -1963,6 +2233,7 @@ function detectImageAll(imageData, rawBuffer) {
     out = findings.filter(f => !['lsb_redundancy', 'lsb_anomaly'].includes(f.technique));
   }
 
+  out.push(rivaganNote());
   out.push(dFinding('learned_pixel_watermark', 'Learned/neural pixel watermark', 0,
     "SynthID-Image and similar neural watermarks need the vendor's private detector model — presence cannot be tested here, so this is unknown rather than absent",
     null, {}, 'unavailable'));

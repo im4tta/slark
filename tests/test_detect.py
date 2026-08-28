@@ -304,6 +304,46 @@ def embed_dwt_dct(rgb, signature: bytes):
     return _yuv_to_rgb(yuv)
 
 
+def _dct2(block):
+    """Orthonormal 2-D DCT-II of a square block (matches cv2.dct)."""
+    n = block.shape[0]
+    k = np.arange(n)[:, None]
+    x = np.arange(n)[None, :]
+    d = np.cos(np.pi * (2 * x + 1) * k / (2 * n)) * np.sqrt(2.0 / n)
+    d[0, :] = np.sqrt(1.0 / n)
+    return d @ block @ d.T, d
+
+
+def embed_dwt_dct_svd(rgb, signature: bytes):
+    """Embed `signature` the way invisible-watermark's dwtDctSvd does.
+
+    Mirrors EmbedDwtDctSvd.diffuse_dct_svd:
+        u, s, v = svd(dct(block)); s[0] = (s[0]//scale + 0.25 + 0.5*bit)*scale
+    """
+    bits = [(byte >> (7 - i)) & 1 for byte in signature for i in range(8)]
+    h, w = rgb.shape[:2]
+    yuv = _rgb_to_yuv(rgb)
+    u = yuv[: h // 4 * 4, : w // 4 * 4, 1]
+    ll, lh, hl, hh = _haar_fwd(u)
+
+    rows, cols = ll.shape
+    num = 0
+    for i in range(rows // DWT_BLOCK):
+        for j in range(cols // DWT_BLOCK):
+            sl = (slice(i * DWT_BLOCK, (i + 1) * DWT_BLOCK),
+                  slice(j * DWT_BLOCK, (j + 1) * DWT_BLOCK))
+            dct, d = _dct2(ll[sl])
+            uu, ss, vv = np.linalg.svd(dct)
+            wm_bit = bits[num % len(bits)]
+            ss[0] = (ss[0] // DWT_SCALE + 0.25 + 0.5 * wm_bit) * DWT_SCALE
+            # inverse orthonormal DCT is D.T @ X @ D
+            ll[sl] = d.T @ (uu @ np.diag(ss) @ vv) @ d
+            num += 1
+
+    yuv[: h // 4 * 4, : w // 4 * 4, 1] = _haar_inv(ll, lh, hl, hh)
+    return _yuv_to_rgb(yuv)
+
+
 # ------------------------------------------------------- images: clean
 
 
@@ -427,13 +467,30 @@ def test_detects_named_generator_in_png_metadata():
 
 
 def test_detects_diffusion_parameters_without_tool_name():
+    # A neutral chunk key, so nothing identifies the *tool* — only the
+    # generation parameters betray that a diffusion pipeline was involved.
     info = PngImagePlugin.PngInfo()
-    info.add_text("parameters", "a cat\nSteps: 20, Sampler: Euler a, Seed: 1")
+    info.add_text("Notes", "a cat\nSteps: 20, Sampler: Euler a, Seed: 1")
     data = to_png_bytes(make_photo(0, n=64), pnginfo=info)
     report = detect.scan_image(data)
     finding = next(f for f in report.detected
                    if f.technique == "generation_parameters")
     assert "diffusion sampler parameters" in finding.evidence["parameters"]
+    assert finding.attribution == "diffusion pipeline (unnamed)"
+
+
+def test_parameters_chunk_identifies_the_webui_itself():
+    """A1111 writes a `parameters` chunk but never its own name (verified
+    against modules/images.py save_image_with_geninfo)."""
+    info = PngImagePlugin.PngInfo()
+    info.add_text("parameters",
+                  "a cat\nNegative prompt: blurry\nSteps: 20, "
+                  "Sampler: DPM++ 2M Karras, CFG scale: 7, Seed: 1")
+    data = to_png_bytes(make_photo(0, n=64), pnginfo=info)
+    report = detect.scan_image(data)
+    finding = next(f for f in report.detected
+                   if f.technique == "container_metadata")
+    assert "AUTOMATIC1111" in finding.attribution
 
 
 def test_c2pa_presence_reported_without_asserting_validity():
@@ -562,3 +619,204 @@ def test_real_reference_decoder_reads_our_test_encoder():
     n = min(expected.size, actual.size)
     ber = float(np.mean(expected[:n] != actual[:n]))
     assert ber < detect._DWT_MAX_BER, f"reference decoder saw {ber:.1%} bit error"
+
+
+# ======================================================= dwtDctSvd variant
+#
+# The second invisible-watermark algorithm. Measured during development
+# (see slark/detect.py for the full notes):
+#
+#   * our reader vs the reference decoder ....... 100.00% bit agreement
+#   * payload recovery on marked images ......... 0.000 bit error (exact)
+#   * clean / noise / flat / gradient ........... 0.3125 minimum bit error
+#
+# Separation is total, which is why dwtDctSvd is the more robust of the two
+# classical modes: dwtDct manages only ~0.30 bit error on the same images.
+
+
+def test_dwt_dct_svd_detects_our_encoder():
+    marked = embed_dwt_dct_svd(make_photo(0), b"StableDiffusionV1")
+    finding = detect.detect_dwt_dct_svd(Image.fromarray(marked))
+    assert finding is not None and finding.status == "detected"
+    assert finding.attribution == "Stable Diffusion 1.x"
+    assert finding.technique == "dwt_dct_svd"
+    assert finding.evidence["bit_error_rate"] <= detect._SVD_MAX_BER
+
+
+@pytest.mark.parametrize("sig,expected", [
+    (b"StableDiffusionV1", "Stable Diffusion 1.x"),
+    (b"StableDiffusionV2", "Stable Diffusion 2.x"),
+])
+def test_dwt_dct_svd_attributes_each_signature(sig, expected):
+    marked = embed_dwt_dct_svd(make_photo(1), sig)
+    finding = detect.detect_dwt_dct_svd(Image.fromarray(marked))
+    assert finding is not None and finding.attribution == expected
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_dwt_dct_svd_clean_photo_is_none(seed):
+    assert detect.detect_dwt_dct_svd(Image.fromarray(make_photo(seed))) is None
+
+
+def test_dwt_dct_svd_no_false_positive_on_degenerate_images():
+    """Flat fills, gradients and pure noise must not attribute."""
+    rng = np.random.default_rng(4)
+    cases = [
+        np.full((256, 256, 3), 0, np.uint8),
+        np.full((256, 256, 3), 128, np.uint8),
+        np.full((256, 256, 3), 255, np.uint8),
+        rng.integers(0, 256, (256, 256, 3), dtype=np.uint8),
+    ]
+    ramp = np.tile(np.linspace(0, 255, 256, dtype=np.uint8), (256, 1))
+    cases.append(np.dstack([ramp] * 3))
+    for arr in cases:
+        assert detect.detect_dwt_dct_svd(Image.fromarray(arr)) is None
+
+
+def test_dwt_dct_svd_matches_our_4x4_dct_against_closed_form():
+    """The batched DCT must be the real orthonormal DCT-II."""
+    rng = np.random.default_rng(5)
+    block = rng.normal(0, 50, (4, 4))
+    d = detect._dct_matrix(4)
+    expected, _ = _dct2(block)
+    assert np.abs((d @ block @ d.T) - expected).max() < 1e-9
+
+
+def test_dwt_dct_svd_registered_in_scan_image():
+    marked = embed_dwt_dct_svd(make_photo(2), b"StableDiffusionV1")
+    report = detect.scan_image(to_png_bytes(marked))
+    assert report.verdict == "watermarked"
+    assert "Stable Diffusion 1.x" in report.attributions()
+    assert any(f.technique == "dwt_dct_svd" for f in report.detected)
+
+
+def test_dwt_dct_and_svd_do_not_cross_trigger():
+    """A dwtDct mark must not be reported as dwtDctSvd, or vice versa."""
+    dct_marked = embed_dwt_dct(make_photo(3), b"StableDiffusionV1")
+    assert detect.detect_dwt_dct_svd(Image.fromarray(dct_marked)) is None
+    svd_marked = embed_dwt_dct_svd(make_photo(3), b"StableDiffusionV1")
+    assert detect.detect_dwt_dct(Image.fromarray(svd_marked)) is None
+
+
+# ========================================================= RivaGAN (keyed)
+
+
+def test_rivagan_without_key_is_unavailable_not_clean():
+    """Blind RivaGAN detection is unreliable, so it must say so rather than
+    imply the image is clean."""
+    finding = detect.detect_rivagan(to_png_bytes(make_photo(0, n=128)))
+    assert finding is not None
+    assert finding.status == "unavailable"
+    assert "keyed" in finding.detail
+
+
+def test_rivagan_note_present_in_scan_image():
+    report = detect.scan_image(to_png_bytes(make_photo(0, n=128)))
+    assert any(f.technique == "rivagan" and f.status == "unavailable"
+               for f in report.unavailable)
+
+
+def test_rivagan_rejects_wrong_key_length():
+    finding = detect.detect_rivagan(to_png_bytes(make_photo(0, n=128)),
+                                    expect=np.zeros(8, np.uint8))
+    assert finding.status == "unavailable"
+    assert "32 bits" in finding.detail
+
+
+def test_unavailable_findings_never_read_as_clean():
+    """A report of only-unavailable findings is inconclusive, not clean."""
+    report = detect.scan_image(to_png_bytes(make_photo(0, n=128)))
+    assert report.detected == []
+    assert report.verdict == "inconclusive"
+
+
+# ============================== metadata signatures: real-world validation
+#
+# These cases come from *observed* real formats, not guesses:
+#   * ComfyUI writes PNG text chunks `prompt` / `workflow` holding a node
+#     graph (source: ComfyUI nodes.py, SaveImage.save_images) and never
+#     writes the string "comfyui".
+#   * AUTOMATIC1111 writes a single `parameters` chunk of infotext (source:
+#     modules/images.py save_image_with_geninfo) and never writes its name.
+#   * Real C2PA manifests declare AI origin with an IPTC digitalSourceType
+#     URI (verified on signed fixtures from the c2pa-rs corpus and against
+#     cv.iptc.org/newscodes/digitalsourcetype).
+#
+# The negatives are the regression guard for a real bug this validation
+# exposed: matching bare words anywhere in the file attributed 6 of 6
+# ordinary captions to AI generators.
+
+
+def _png_with_text(**fields) -> bytes:
+    info = PngImagePlugin.PngInfo()
+    for key, value in fields.items():
+        info.add_text(key.replace("__", ":"), value)
+    return to_png_bytes(make_photo(0, n=64), pnginfo=info)
+
+
+def test_comfyui_identified_by_chunk_key_not_by_name():
+    data = _png_with_text(prompt=json.dumps(
+        {"3": {"class_type": "KSampler", "inputs": {"seed": 42, "steps": 20}}}))
+    assert b"comfyui" not in data.lower(), "fixture must not name the tool"
+    report = detect.scan_image(data)
+    assert report.verdict == "watermarked"
+    assert any("ComfyUI" in a for a in report.attributions())
+
+
+def test_iptc_trained_algorithmic_media_is_detected():
+    """The authoritative 'this is generative AI' declaration."""
+    data = _png_with_text(XML__com__adobe__xmp=(
+        '<rdf:Description Iptc4xmpExt:DigitalSourceType='
+        '"http://cv.iptc.org/newscodes/digitalsourcetype/'
+        'trainedAlgorithmicMedia"/>'))
+    report = detect.scan_image(data)
+    assert report.verdict == "watermarked"
+    assert any("trainedAlgorithmicMedia" in a for a in report.attributions())
+
+
+def test_specific_iptc_term_wins_over_generic_substring():
+    data = _png_with_text(XML__com__adobe__xmp=(
+        '<rdf:Description Iptc4xmpExt:DigitalSourceType='
+        '"http://cv.iptc.org/newscodes/digitalsourcetype/'
+        'trainedAlgorithmicMedia"/>'))
+    attributions = detect.scan_image(data).attributions()
+    assert "Algorithmic media (IPTC algorithmicMedia)" not in attributions
+
+
+def test_novelai_real_format():
+    data = _png_with_text(Software="NovelAI",
+                          Comment=json.dumps({"steps": 28, "scale": 11}))
+    assert detect.scan_image(data).attributions()[:1] == ["NovelAI"]
+
+
+@pytest.mark.parametrize("software,expected", [
+    ("Google Imagen 3", "Google Imagen"),
+    ("FLUX.1-dev", "Black Forest Labs FLUX"),
+    ("Grok Imagine", "xAI Grok"),
+    ("Adobe Firefly", "Adobe Firefly"),
+])
+def test_ambiguous_names_count_inside_provenance_fields(software, expected):
+    report = detect.scan_image(_png_with_text(Software=software))
+    assert expected in report.attributions()
+
+
+@pytest.mark.parametrize("caption", [
+    "Descripcion: una imagen de mi perro en el parque",  # "imagen" = image
+    "Magnetic flux density map, Helmholtz coil",          # "flux"
+    "Solar flux 10.7cm index recorded at observatory",    # "flux"
+    "Notes: I finally grok this lens",                    # "grok"
+    "A firefly at dusk in the meadow",                    # "firefly"
+    "Gemini constellation over the desert",               # "gemini"
+])
+def test_ordinary_captions_are_not_attributed_to_ai(caption):
+    """Regression guard: these six all false-positived before the fix."""
+    report = detect.scan_image(_png_with_text(Description=caption))
+    assert report.verdict != "watermarked", f"false positive on {caption!r}"
+    assert report.attributions() == []
+
+
+@pytest.mark.parametrize("software", ["Adobe Photoshop 24.0", "NIKON D850",
+                                      "GIMP 2.10", "darktable 4.4"])
+def test_ordinary_editing_software_is_not_ai_attribution(software):
+    report = detect.scan_image(_png_with_text(Software=software))
+    assert report.attributions() == []
