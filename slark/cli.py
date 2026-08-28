@@ -19,6 +19,11 @@ Usage:
     slark strip-image --file out.png --output clean.png
     slark capacity --file photo.png     # tag capacity report
 
+    # Detect OTHER tools' watermarks (requires slark[detect])
+    slark scan --file suspicious.txt    # scan text for any hidden payload
+    slark scan --file photo.png --image # scan an image (all detectors)
+    slark scan --text "..." --json      # machine-readable report
+
     Text subcommands also read stdin when neither --text nor --file is given:
         echo "Hello world" | slark encode --model gpt-5 | slark decode
 
@@ -192,6 +197,64 @@ def cmd_strip_image(args):
     print(f"Wrote {out}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------- scan
+
+
+def cmd_scan(args):
+    """Scan for hidden payloads from Slark *and other tools*.
+
+    Exit codes: 0 = something detected, 1 = clean, 3 = suspicious-only,
+    4 = inconclusive (nothing found, but some detectors could not run).
+    """
+    from . import detect
+
+    is_image = args.image or (
+        args.file and args.file.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"))
+    )
+    if is_image:
+        if not args.file:
+            print("--image requires --file", file=sys.stderr)
+            sys.exit(2)
+        report = detect.scan_image(args.file, include_notes=not args.no_notes)
+    else:
+        report = detect.scan_text(_read_input(args), include_notes=not args.no_notes)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False))
+    else:
+        _print_report(report, verbose=args.verbose)
+
+    return {"watermarked": 0, "clean": 1, "suspicious": 3,
+            "inconclusive": 4}[report.verdict]
+
+
+def _print_report(report, verbose: bool = False) -> None:
+    """Human-readable report: verdict, then the evidence behind it."""
+    icons = {"detected": "!!", "suspicious": " ?", "unavailable": " -"}
+    print(f"target:  {report.target}")
+    print(f"verdict: {report.verdict}  (confidence {report.confidence:.0%})")
+    if report.attributions():
+        print(f"points to: {', '.join(report.attributions())}")
+
+    shown = report.detected + report.suspicious
+    if not shown:
+        print("\nNo hidden payload found by any available detector.")
+    else:
+        print()
+        for f in shown:
+            print(f" {icons[f.status]} {f.label} [{f.technique}]")
+            print(f"      {f.detail}")
+            if verbose and f.evidence:
+                for k, v in f.evidence.items():
+                    print(f"      · {k}: {v}")
+
+    if report.unavailable:
+        print("\nCould not be tested (absence NOT proven):")
+        for f in report.unavailable:
+            print(f" {icons[f.status]} {f.label}: {f.detail}")
+
+
 # ---------------------------------------------------------------- parser
 
 
@@ -270,6 +333,20 @@ def build_parser():
     sp.add_argument("--file", required=True, help="Path to image to check")
     sp.set_defaults(func=cmd_check_image)
 
+    sp = sub.add_parser(
+        "scan",
+        help="Detect watermarks/hidden payloads from Slark AND other tools")
+    add_io_args(sp)
+    sp.add_argument("--image", action="store_true",
+                    help="Treat --file as an image (auto-detected by extension)")
+    sp.add_argument("--json", action="store_true",
+                    help="Machine-readable single-line JSON report")
+    sp.add_argument("--verbose", action="store_true",
+                    help="Also print the raw evidence for each finding")
+    sp.add_argument("--no-notes", action="store_true",
+                    help="Hide detector classes that cannot be tested")
+    sp.set_defaults(func=cmd_scan)
+
     sp = sub.add_parser("strip-image", help="Erase any tag from an image (PNG output)")
     sp.add_argument("--file", required=True, help="Path to input image")
     sp.add_argument("--output", help="Path to write PNG (default: clean.png)")
@@ -281,7 +358,9 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    rc = args.func(args)
+    if rc:  # subcommands that return an explicit exit code
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

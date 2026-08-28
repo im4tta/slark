@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "slark"
 version = "0.2.0"
-description = "Invisible zero-width text and PNG pixel watermarking for marking AI-generated (or any) content"
+description = "Invisible watermarking for text and images — embed your own marks, and detect other AI tools' watermarks and hidden payloads"
 readme = "README.md"
 requires-python = ">=3.8"
 
@@ -13,7 +13,8 @@ license = { text = "MIT" }
 authors = [
     { name = "Sakha" }
 ]
-keywords = ["watermark", "steganography", "ai-generated", "provenance", "unicode"]
+keywords = ["watermark", "steganography", "ai-generated", "provenance", "unicode",
+            "watermark-detection", "c2pa", "stable-diffusion", "homoglyph", "ai-detection"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -37,7 +38,9 @@ slark = "slark.cli:main"
 
 [project.optional-dependencies]
 image = ["pillow>=9.0"]
-dev = ["pytest>=7.0", "pillow>=9.0"]
+detect = ["pillow>=9.0", "numpy>=1.20"]
+all = ["pillow>=9.0", "numpy>=1.20"]
+dev = ["pytest>=7.0", "pillow>=9.0", "numpy>=1.20"]
 
 [tool.setuptools.packages.find]
 include = ["slark*"]

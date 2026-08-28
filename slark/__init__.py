@@ -15,6 +15,16 @@ Signed marks (forge-resistant with a shared secret):
     >>> slark.verify(marked, "wrong-key")
     'invalid'
 
+Detecting *other* tools' watermarks (``pip install "slark[detect]"``):
+
+    >>> report = slark.scan_text(suspicious_text)
+    >>> report.verdict
+    'watermarked'
+    >>> [f.technique for f in report.detected]
+    ['unicode_tag_chars']
+    >>> slark.scan_image("photo.png").attributions()
+    ['Stable Diffusion 1.x']
+
 Image tagging (requires ``pip install "slark[image]"``):
 
     >>> from slark import image
@@ -23,6 +33,13 @@ Image tagging (requires ``pip install "slark[image]"``):
     {'g': 'ai', 'ts': 1234567890, 'm': 'claude-sonnet-5'}
 """
 
+from .detect import (
+    Finding,
+    Report,
+    scan,
+    scan_image,
+    scan_text,
+)
 from .core import (
     decode,
     decode_all,
@@ -35,7 +52,7 @@ from .core import (
     verify_meta,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "encode",
     "decode",
@@ -46,5 +63,11 @@ __all__ = [
     "has_watermark",
     "strip",
     "count_hidden_chars",
+    # detection of other tools' watermarks (v0.4)
+    "scan",
+    "scan_text",
+    "scan_image",
+    "Report",
+    "Finding",
     "__version__",
 ]

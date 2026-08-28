@@ -81,3 +81,108 @@ def test_capacity_untaggable(capsys, tmp_path):
     Image.new("RGB", (16, 16)).save(p)
     code, stdout, _ = run(["capacity", "--file", str(p)], capsys)
     assert code == 1 and json.loads(stdout)["taggable"] is False
+
+
+# ---------------------------------------------------------------- scan (v0.4)
+#
+# `cmd_scan` returns its exit code rather than raising SystemExit (main()
+# performs the exit), so these call it directly and check the return value.
+
+
+def scan_rc(argv, capsys):
+    parser = cli.build_parser()
+    args = parser.parse_args(argv)
+    rc = args.func(args)
+    out = capsys.readouterr()
+    return rc, out.out, out.err
+
+
+def tagged(payload: str) -> str:
+    """ASCII smuggled into the invisible Unicode TAG block."""
+    return "".join(chr(0xE0000 + ord(c)) for c in payload)
+
+
+def test_scan_detects_tag_smuggling(capsys):
+    rc, stdout, _ = scan_rc(
+        ["scan", "--text", f"Normal looking sentence.{tagged('LEAK')}"], capsys)
+    assert rc == 0
+    assert "watermarked" in stdout
+    assert "unicode_tag_chars" in stdout
+    assert "LEAK" in stdout
+
+
+def test_scan_clean_text_is_inconclusive(capsys):
+    """Keyed statistical marks can't be tested -> inconclusive, not clean."""
+    rc, stdout, _ = scan_rc(
+        ["scan", "--text", "A perfectly ordinary sentence, nothing hidden."],
+        capsys)
+    assert rc == 4
+    assert "inconclusive" in stdout
+    assert "absence NOT proven" in stdout
+
+
+def test_scan_no_notes_reports_clean(capsys):
+    rc, stdout, _ = scan_rc(
+        ["scan", "--no-notes", "--text",
+         "A perfectly ordinary sentence, nothing hidden."], capsys)
+    assert rc == 1
+    assert "clean" in stdout
+
+
+def test_scan_bidi_is_suspicious(capsys):
+    rc, stdout, _ = scan_rc(
+        ["scan", "--text", "safe_code\u202ereversed\u202c plus more text."], capsys)
+    assert rc == 3
+    assert "suspicious" in stdout
+
+
+def test_scan_json_output(capsys):
+    rc, stdout, _ = scan_rc(
+        ["scan", "--json", "--text", f"Body text.{tagged('X')}"], capsys)
+    assert rc == 0
+    payload = json.loads(stdout)
+    assert payload["verdict"] == "watermarked"
+    assert payload["findings"][0]["technique"] == "unicode_tag_chars"
+
+
+def test_scan_finds_slark_mark(capsys, tmp_path):
+    import slark
+    src = tmp_path / "marked.txt"
+    src.write_text(slark.encode("Content to scan here.", model="gpt-5"),
+                   encoding="utf-8")
+    rc, stdout, _ = scan_rc(["scan", "--file", str(src)], capsys)
+    assert rc == 0
+    assert "slark_zero_width" in stdout
+    assert "gpt-5" in stdout
+
+
+def test_scan_verbose_shows_evidence(capsys):
+    rc, stdout, _ = scan_rc(
+        ["scan", "--verbose", "--text", f"Body.{tagged('SECRET')}"], capsys)
+    assert rc == 0
+    assert "decoded" in stdout  # raw evidence key
+
+
+def test_scan_image_reports_slark_tag(capsys, tmp_path):
+    """A .png path routes to the image detectors automatically."""
+    pytest.importorskip("numpy")
+    Image = pytest.importorskip("PIL.Image")
+    from slark import image as slkimg
+
+    src = tmp_path / "plain.png"
+    Image.new("RGB", (128, 128), (90, 120, 150)).save(src)
+    out = tmp_path / "marked.png"
+    slkimg.encode(str(src), model="claude-sonnet-5").save(out, format="PNG")
+
+    rc, stdout, _ = scan_rc(["scan", "--file", str(out)], capsys)
+    assert rc == 0
+    assert "slark_slk1" in stdout
+    assert "claude-sonnet-5" in stdout
+
+
+def test_scan_image_flag_forces_image_mode(capsys, tmp_path):
+    Image = pytest.importorskip("PIL.Image")
+    p = tmp_path / "noext"
+    Image.new("RGB", (64, 64), (10, 20, 30)).save(p, format="PNG")
+    rc, stdout, _ = scan_rc(["scan", "--image", "--file", str(p)], capsys)
+    assert "target:  image" in stdout
